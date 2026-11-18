@@ -33,9 +33,19 @@ import (
 )
 
 const (
-	maxQueue = 2000 // about 8 hours of readings at 15 seconds
-	maxBatch = 120  // readings per request in Prometheus mode (30 minutes)
+	bufferFor = 8 * time.Hour // how much history to keep while the connection is down
+	maxQueued = 10000         // hard ceiling on queued readings, whatever the interval
+	maxBatch  = 120           // readings per request in Prometheus mode
 )
+
+// queueCap keeps the offline buffer worth the same amount of time at any --interval,
+// so a shorter interval does not silently shorten how long an outage can last.
+func queueCap(interval time.Duration) int {
+	if interval <= 0 {
+		return maxQueued
+	}
+	return min(max(int(bufferFor/interval), 100), maxQueued)
+}
 
 type Sample struct {
 	TS        int64   `json:"ts"`
@@ -157,8 +167,8 @@ func (a *agent) run(ctx context.Context, dry bool) {
 			continue
 		}
 		a.queue = append(a.queue, s)
-		if len(a.queue) > maxQueue {
-			a.queue = a.queue[len(a.queue)-maxQueue:]
+		if cap := queueCap(a.interval); len(a.queue) > cap {
+			a.queue = a.queue[len(a.queue)-cap:]
 		}
 		a.flush(ctx)
 	}

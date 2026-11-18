@@ -268,7 +268,8 @@ Run it by hand first, so you see errors directly instead of hunting through Task
   --remote-write "$PROM/api/v1/write" `
   --hub "Ujjain" `
   --temple "Mahakal temple" `
-  --name "Main hall 1"
+  --name "Main hall 1" `
+  --interval 5s
 ```
 
 Expect one line and then silence:
@@ -319,11 +320,15 @@ cd C:\StreamMonitor
   -RemoteWrite "$PROM/api/v1/write" `
   -Hub "Ujjain" `
   -Temple "Mahakal temple" `
-  -Name "Main hall 1"
+  -Name "Main hall 1" `
+  -Interval 5s
 ```
 
 This copies the exe to `C:\ProgramData\StreamMonitor\`, registers the `StreamMonitorAgent` task to run
 as SYSTEM at startup, restarts it on failure (99 retries, 1 min apart), and starts it immediately.
+
+`-Interval` defaults to `15s` if omitted. A shorter interval does **not** shorten the offline buffer:
+the agent sizes its queue from the interval so it always holds ~8 hours of readings.
 
 > This installer has **never been run on a real Windows machine**. Expect to debug it on this first
 > laptop — that is the point of doing one before the rest.

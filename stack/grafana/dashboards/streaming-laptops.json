@@ -507,7 +507,7 @@
       "type": "prometheus",
       "uid": "${datasource}"
      },
-     "expr": "max by (hub, temple, device) (last_over_time(stream_laptop_network_upload_bps{hub=~\"$hub\",temple=~\"$temple\"}[5m]))",
+     "expr": "(max by (hub, temple, device) (last_over_time(stream_laptop_network_upload_bps{hub=~\"$hub\",temple=~\"$temple\"}[5m]))) / 1e6",
      "refId": "E",
      "instant": true,
      "range": false,
@@ -775,11 +775,11 @@
       "properties": [
        {
         "id": "unit",
-        "value": "bps"
+        "value": "suffix: Mbps"
        },
        {
         "id": "decimals",
-        "value": 1
+        "value": 2
        }
       ]
      },

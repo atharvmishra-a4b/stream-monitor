@@ -388,7 +388,7 @@
       "type": "prometheus",
       "uid": "${datasource}"
      },
-     "expr": "max(last_over_time(stream_laptop_network_upload_bps{hub=\"$hub\",temple=\"$temple\",device=\"$device\"}[5m]))",
+     "expr": "(max(last_over_time(stream_laptop_network_upload_bps{hub=\"$hub\",temple=\"$temple\",device=\"$device\"}[5m]))) / 1e6",
      "refId": "A",
      "instant": true,
      "range": false,
@@ -410,8 +410,8 @@
       ]
      },
      "mappings": [],
-     "unit": "bps",
-     "decimals": 1
+     "unit": "suffix: Mbps",
+     "decimals": 2
     },
     "overrides": []
    },
@@ -449,7 +449,7 @@
       "type": "prometheus",
       "uid": "${datasource}"
      },
-     "expr": "max(last_over_time(stream_laptop_network_download_bps{hub=\"$hub\",temple=\"$temple\",device=\"$device\"}[5m]))",
+     "expr": "(max(last_over_time(stream_laptop_network_download_bps{hub=\"$hub\",temple=\"$temple\",device=\"$device\"}[5m]))) / 1e6",
      "refId": "A",
      "instant": true,
      "range": false,
@@ -471,8 +471,8 @@
       ]
      },
      "mappings": [],
-     "unit": "bps",
-     "decimals": 1
+     "unit": "suffix: Mbps",
+     "decimals": 2
     },
     "overrides": []
    },
@@ -785,7 +785,7 @@
       "type": "prometheus",
       "uid": "${datasource}"
      },
-     "expr": "stream_laptop_network_upload_bps{hub=\"$hub\",temple=\"$temple\",device=\"$device\"}",
+     "expr": "(stream_laptop_network_upload_bps{hub=\"$hub\",temple=\"$temple\",device=\"$device\"}) / 1e6",
      "refId": "A",
      "instant": false,
      "range": true,
@@ -795,7 +795,7 @@
    ],
    "fieldConfig": {
     "defaults": {
-     "unit": "bps",
+     "unit": "suffix: Mbps",
      "color": {
       "mode": "fixed",
       "fixedColor": "green"
@@ -806,7 +806,8 @@
       "showPoints": "never",
       "spanNulls": false,
       "axisSoftMin": 0
-     }
+     },
+     "decimals": 2
     },
     "overrides": []
    },
@@ -840,7 +841,7 @@
       "type": "prometheus",
       "uid": "${datasource}"
      },
-     "expr": "stream_laptop_network_download_bps{hub=\"$hub\",temple=\"$temple\",device=\"$device\"}",
+     "expr": "(stream_laptop_network_download_bps{hub=\"$hub\",temple=\"$temple\",device=\"$device\"}) / 1e6",
      "refId": "A",
      "instant": false,
      "range": true,
@@ -850,7 +851,7 @@
    ],
    "fieldConfig": {
     "defaults": {
-     "unit": "bps",
+     "unit": "suffix: Mbps",
      "color": {
       "mode": "fixed",
       "fixedColor": "teal"
@@ -861,7 +862,8 @@
       "showPoints": "never",
       "spanNulls": false,
       "axisSoftMin": 0
-     }
+     },
+     "decimals": 2
     },
     "overrides": []
    },

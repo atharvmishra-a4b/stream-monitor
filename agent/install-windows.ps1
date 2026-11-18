@@ -3,7 +3,11 @@
 #
 #   .\install-windows.ps1 -RemoteWrite https://prometheus.example.org/api/v1/write `
 #                         -Hub "Ujjain" -Temple "Temple A" -Name "Main hall 1" `
+#                         -Interval 5s `
 #                         -Username <user> -Password <password>
+#
+# -Interval defaults to 15s. A shorter interval does not shrink the offline buffer:
+# the agent keeps ~8 hours of readings whatever the interval.
 #
 # NOTE: not yet run on a real Windows laptop. Try it on one machine first.
 # The laptop's clock must be correct (Windows: Settings > Time & language > Sync now), or readings are rejected.
@@ -12,6 +16,7 @@ param(
   [Parameter(Mandatory)] [string] $Hub,
   [Parameter(Mandatory)] [string] $Temple,
   [string] $Name = $env:COMPUTERNAME,
+  [string] $Interval = "15s",          # how often to measure, e.g. 5s, 15s, 1m
   [string] $Username = "",
   [string] $Password = "",
   [string] $Exe = "$PSScriptRoot\stream-agent-windows.exe"
@@ -26,7 +31,7 @@ Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyCo
 New-Item -ItemType Directory -Force -Path $dir | Out-Null
 Copy-Item $Exe "$dir\stream-agent.exe" -Force
 
-$agentArgs = "--remote-write `"$RemoteWrite`" --hub `"$Hub`" --temple `"$Temple`" --name `"$Name`""
+$agentArgs = "--remote-write `"$RemoteWrite`" --hub `"$Hub`" --temple `"$Temple`" --name `"$Name`" --interval `"$Interval`""
 if ($Username) { $agentArgs += " --username `"$Username`" --password `"$Password`"" }
 $action   = New-ScheduledTaskAction -Execute "$dir\stream-agent.exe" -Argument $agentArgs -WorkingDirectory $dir
 $trigger  = New-ScheduledTaskTrigger -AtStartup
