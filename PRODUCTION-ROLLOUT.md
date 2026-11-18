@@ -1,29 +1,50 @@
 # Production rollout — first Windows laptop
 
-Two parts: what the **infra engineer** changes on the Prometheus box, and how **you** bring up and test
-the first Windows laptop. Do them in that order — the laptop has nothing to talk to until part A is done.
+**Do the sandbox first.** Everything below is written to be run twice: once against sandbox to prove
+the whole chain works, then against production. The only thing that changes between the two runs is
+the host.
 
-**Target Prometheus** (verified 2026-11-17):
+### The two environments (verified 2026-11-18)
 
-| | |
-|---|---|
-| Host | `ec2-65-1-25-0.ap-south-1.compute.amazonaws.com` (ap-south-1) |
-| Version | 2.50.1 — supports everything below |
-| Grafana datasource | name `Prometheus`, uid `rrgl-gJSk` (default) |
-| Config file | `/etc/prometheus/prometheus.yml` |
-| Existing rule file | `/etc/prometheus/alert.rules` |
-| Alertmanager | `alertmanager:9093`, already wired up |
-| Runs as | Docker Compose on the EC2 box |
+| | Sandbox — **do this first** | Production |
+|---|---|---|
+| Prometheus | `https://monitor-sbox.a4b.io:9090` | `https://monitor.a4b.io:9090` |
+| Grafana | `https://monitor-sbox.a4b.io` | `https://monitor.a4b.io` |
+| Prometheus version | 2.54.1 | 2.50.1 |
+| Grafana version | 11.2.2 | 11.4.0 |
+| Scrape targets at risk | 112 | 234 |
+| `web.enable-remote-write-receiver` | **false** — must be enabled | **false** — must be enabled |
+| `web.enable-lifecycle` | **true** — config hot-reloads | false — rules need SIGHUP |
+| Retention | 30d | 15d (default, unset) |
+| Grafana datasource uid | *(not checked — needs sbox login)* | `rrgl-gJSk` |
 
-> **Auth is deliberately deferred.** Per the infra decision, the write endpoint goes up unauthenticated
-> for now and auth lands later across everything. Consequences while that's true, so nobody is surprised:
-> anyone on the internet can write arbitrary metrics into this Prometheus, and laptop readings travel in
-> plaintext over HTTP. Port 9090 is **already** publicly reachable and unauthenticated for reads today,
-> so this widens an existing exposure rather than creating a new one. Revisit at the auth rollout.
+Both Prometheus instances run as Docker Compose, config at `/etc/prometheus/prometheus.yml`, with
+Alertmanager already wired up. Production's existing rule file is `/etc/prometheus/alert.rules`.
+
+> **Use the `https://monitor*.a4b.io:9090` URLs, not the EC2 hostname.** `monitor.a4b.io:9090` and
+> `http://ec2-65-1-25-0.ap-south-1.compute.amazonaws.com:9090` are the **same Prometheus** — verified
+> identical version and target count — but the `monitor.a4b.io` path goes through the load balancer
+> with TLS. That gives you encryption in transit for free, and a stable name that survives the EC2
+> instance being replaced. There is no reason to point laptops at the raw instance.
+
+> **Auth is deliberately deferred.** Per the infra decision the write endpoint goes up unauthenticated
+> for now, with auth landing later across everything. Known consequences: anyone who can reach the
+> endpoint can write arbitrary metrics into Prometheus. Port 9090 is already publicly reachable and
+> unauthenticated **for reads** on both environments today, so enabling writes widens an existing
+> exposure rather than creating a new one. Using the TLS URLs at least removes the plaintext problem.
+> Revisit at the auth rollout.
 
 ---
 
 ## Part A — Prometheus changes (infra engineer)
+
+Every command below uses `$PROM`. Set it once per environment, and run the whole of Part A against
+sandbox before you touch production:
+
+```bash
+export PROM=https://monitor-sbox.a4b.io:9090    # sandbox — do this run first
+# export PROM=https://monitor.a4b.io:9090       # production — only after sandbox passes
+```
 
 ### A1. Enable the remote-write receiver
 
@@ -34,14 +55,16 @@ In the Prometheus service definition in `docker-compose.yml`, add one flag:
 ```yaml
 services:
   prometheus:
-    image: prom/prometheus:v2.50.1
+    # image: leave at whatever this environment already runs
+    #   sandbox v2.54.1 / production v2.50.1 — both support everything here
     command:
       - --config.file=/etc/prometheus/prometheus.yml
       - --web.enable-remote-write-receiver     # <-- ADD THIS
       # ... keep every existing flag exactly as-is
 ```
 
-**This one needs a real restart** — it is a process flag, not config. `SIGHUP` will not pick it up.
+**This one needs a real restart** — it is a process flag, not config. `SIGHUP` will not pick it up,
+and neither will `/-/reload` on sandbox. Both environments currently have it `false`.
 
 ### A2. Allow backfill after a laptop is offline
 
@@ -65,14 +88,18 @@ an overnight outage loses most of its history. 12h comfortably covers the agent'
 the rules both dashboards render completely empty even when data is arriving.
 
 1. Copy `stack/prometheus/rules.yml` from this repo to the host and mount it at
-   `/etc/prometheus/stream-rules.yml` (same volume as the existing `alert.rules`).
-2. Append it to `rule_files` in `prometheus.yml`:
+   `/etc/prometheus/stream-rules.yml` (same volume as any existing rule file).
+2. Append it to `rule_files` in `prometheus.yml`, keeping whatever is already listed:
 
 ```yaml
 rule_files:
-- /etc/prometheus/alert.rules          # existing — leave alone
+- /etc/prometheus/alert.rules          # production's existing file — leave alone
 - /etc/prometheus/stream-rules.yml     # <-- ADD THIS
 ```
+
+Rule-file changes do **not** need a restart. On sandbox `web.enable-lifecycle` is `true`, so
+`curl -X POST $PROM/-/reload` is enough. On production that endpoint is disabled, so use
+`docker kill -s HUP <prometheus-container>`.
 
 What it defines: 4 recording rules (`stream:window_active`, `stream:laptop_last_seen_seconds`,
 `stream:laptop_problem`, `stream:laptop_status`) and 2 alerts (`StreamLaptopOffline`,
@@ -131,23 +158,29 @@ Then, from anywhere:
 ```bash
 # 1. receiver is live — expect 400 (not 404). 400 means "endpoint exists, bad body", which is correct.
 curl -s -o /dev/null -w "%{http_code}\n" -X POST \
-  http://ec2-65-1-25-0.ap-south-1.compute.amazonaws.com:9090/api/v1/write
+  $PROM/api/v1/write
 
 # 2. flag is actually set — expect "true"
-curl -s http://ec2-65-1-25-0.ap-south-1.compute.amazonaws.com:9090/api/v1/status/flags \
+curl -s $PROM/api/v1/status/flags \
   | tr ',' '\n' | grep remote-write-receiver
 
 # 3. rules loaded — expect the 4 stream: rules listed
-curl -s http://ec2-65-1-25-0.ap-south-1.compute.amazonaws.com:9090/api/v1/rules \
+curl -s $PROM/api/v1/rules \
   | tr ',' '\n' | grep 'stream:'
 
-# 4. the other 236 targets still scraping normally
-curl -s 'http://ec2-65-1-25-0.ap-south-1.compute.amazonaws.com:9090/api/v1/query?query=count(up)'
+# 4. existing targets still scraping normally
+curl -s "$PROM/api/v1/query?query=count(up)"
 ```
 
-Step 4 matters: ~18 targets were already failing before this change (including the `prometheus`
-self-scrape, `bff`, `neo`, `herald`, `hop`, `otel`). **Record the exact count before restarting** so a
-pre-existing failure isn't mistaken for fallout from this change.
+Step 4 matters. Baselines taken 2026-11-18, **before** any change:
+
+| | Sandbox | Production |
+|---|---|---|
+| `count(up)` | 112 | 234 |
+
+Production also had ~18 targets already failing (including the `prometheus` self-scrape, `bff`, `neo`,
+`herald`, `hop`, `otel`). **Re-record the exact count immediately before restarting** so a pre-existing
+failure isn't mistaken for fallout from this change.
 
 ### A6. Rollback
 
@@ -168,12 +201,19 @@ From this repo, after running `agent/build.sh`:
 
 ### The URL to use
 
+Test against sandbox first. The laptop steps are identical for both; only this URL changes.
+
 ```
-http://ec2-65-1-25-0.ap-south-1.compute.amazonaws.com:9090/api/v1/write
+https://monitor-sbox.a4b.io:9090/api/v1/write     # sandbox — start here
+https://monitor.a4b.io:9090/api/v1/write          # production — after sandbox passes
 ```
 
-Note it is **`http`**, port **`9090`**, and there is **no** `-Username` / `-Password` until auth lands.
-Omit those parameters entirely — the installer only adds the flags if a username is supplied.
+Note it is **`https`** on port **`9090`**, and there is **no** `-Username` / `-Password` until auth
+lands. Omit those parameters entirely — the installer only adds the flags if a username is supplied.
+
+Moving a laptop from sandbox to production later just means re-running `install-windows.ps1` with the
+production URL; it unregisters and re-registers the scheduled task. Note the readings already sent to
+sandbox stay there — history does not follow the laptop across environments.
 
 ### Step 1 — Put the files in place
 
@@ -225,7 +265,7 @@ Run it by hand first, so you see errors directly instead of hunting through Task
 
 ```powershell
 .\stream-agent-windows.exe `
-  --remote-write "http://ec2-65-1-25-0.ap-south-1.compute.amazonaws.com:9090/api/v1/write" `
+  --remote-write "$PROM/api/v1/write" `
   --hub "Ujjain" `
   --temple "Mahakal temple" `
   --name "Main hall 1"
@@ -233,7 +273,7 @@ Run it by hand first, so you see errors directly instead of hunting through Task
 
 Expect one line and then silence:
 ```
-sending to http://ec2-65-1-25-0...:9090/api/v1/write as Ujjain / Mahakal temple / Main hall 1
+sending to $PROM/api/v1/write as Ujjain / Mahakal temple / Main hall 1
 ```
 
 **Silence is success.** The agent only logs again on failure. If you see repeated errors:
@@ -251,7 +291,7 @@ Leave it running for the next step.
 From your Mac, or any browser:
 
 ```bash
-curl -s 'http://ec2-65-1-25-0.ap-south-1.compute.amazonaws.com:9090/api/v1/query' \
+curl -s '$PROM/api/v1/query' \
   --data-urlencode 'query=stream_laptop_cpu_percent'
 ```
 
@@ -259,7 +299,7 @@ You should see your `hub`, `temple` and `device` labels. Then check the derived 
 this proves A3 worked:
 
 ```bash
-curl -s 'http://ec2-65-1-25-0.ap-south-1.compute.amazonaws.com:9090/api/v1/query' \
+curl -s '$PROM/api/v1/query' \
   --data-urlencode 'query=stream:laptop_status'
 ```
 
@@ -276,7 +316,7 @@ Only once steps 4 and 5 passed. In an **elevated** PowerShell (Run as Administra
 cd C:\StreamMonitor
 
 .\install-windows.ps1 `
-  -RemoteWrite "http://ec2-65-1-25-0.ap-south-1.compute.amazonaws.com:9090/api/v1/write" `
+  -RemoteWrite "$PROM/api/v1/write" `
   -Hub "Ujjain" `
   -Temple "Mahakal temple" `
   -Name "Main hall 1"
@@ -317,13 +357,26 @@ Remove-Item -Recurse C:\ProgramData\StreamMonitor
 
 ## Part C — Grafana
 
-Import both dashboards from `stack/grafana/dashboards/`:
+**Production is already done.** A `Streaming` folder was created and both dashboards imported on
+2026-11-17:
 
-1. Dashboards → New → Import → upload `streaming-laptops.json`, then `streaming-laptop.json`
-2. For the datasource prompt, pick **`Prometheus`** (uid `rrgl-gJSk`)
-3. Suggest a new `Streaming` folder — the only existing folders are `Data Platform` and `Infra`
+- https://monitor.a4b.io/d/stream-fleet — Streaming laptops (fleet)
+- https://monitor.a4b.io/d/stream-device — Streaming laptop (detail)
 
-The dashboards use a `${datasource}` template variable, so no JSON editing is needed.
+They point at the `Prometheus` datasource (uid `rrgl-gJSk`) and will read "No data" until A1 and A3
+are done. Nothing further is needed on production Grafana.
+
+**Sandbox still needs importing.** On https://monitor-sbox.a4b.io:
+
+1. Dashboards → New → Import → upload `stack/grafana/dashboards/streaming-laptops.json`, then
+   `streaming-laptop.json`
+2. At the datasource prompt pick the sandbox Prometheus (its uid was not checked — the sandbox
+   Grafana API requires a login, unlike production's)
+3. Put them in a new `Streaming` folder
+
+The dashboards use a `${datasource}` template variable, so no JSON editing is needed for either
+environment. The uids `stream-fleet` and `stream-device` are hardcoded, so the sandbox URLs will be
+the same paths under `monitor-sbox.a4b.io`.
 
 ---
 
