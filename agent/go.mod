@@ -3,6 +3,7 @@ module github.com/dev-a4b/stream-monitor/agent
 go 1.23
 
 require (
+	github.com/coder/websocket v1.8.15
 	github.com/golang/snappy v0.0.4
 	github.com/shirou/gopsutil/v4 v4.24.12
 	google.golang.org/protobuf v1.35.2

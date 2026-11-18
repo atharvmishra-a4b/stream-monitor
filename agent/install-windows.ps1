@@ -9,6 +9,10 @@
 # -Interval defaults to 15s. A shorter interval does not shrink the offline buffer:
 # the agent keeps ~8 hours of readings whatever the interval.
 #
+# -ObsPassword turns on OBS metrics (dropped frames, reconnects, real stream bitrate). Enable the
+# server first in OBS: Tools > WebSocket Server Settings > Enable WebSocket server. Without it the
+# agent behaves exactly as before, so it is safe to omit on laptops that do not run OBS.
+#
 # NOTE: not yet run on a real Windows laptop. Try it on one machine first.
 # The laptop's clock must be correct (Windows: Settings > Time & language > Sync now), or readings are rejected.
 param(
@@ -17,6 +21,8 @@ param(
   [Parameter(Mandatory)] [string] $Temple,
   [string] $Name = $env:COMPUTERNAME,
   [string] $Interval = "15s",          # how often to measure, e.g. 5s, 15s, 1m
+  [string] $ObsPassword = "",          # OBS > Tools > WebSocket Server Settings; enables OBS metrics
+  [string] $ObsUrl = "ws://127.0.0.1:4455",
   [string] $Username = "",
   [string] $Password = "",
   [string] $Exe = "$PSScriptRoot\stream-agent-windows.exe"
@@ -32,7 +38,8 @@ New-Item -ItemType Directory -Force -Path $dir | Out-Null
 Copy-Item $Exe "$dir\stream-agent.exe" -Force
 
 $agentArgs = "--remote-write `"$RemoteWrite`" --hub `"$Hub`" --temple `"$Temple`" --name `"$Name`" --interval `"$Interval`""
-if ($Username) { $agentArgs += " --username `"$Username`" --password `"$Password`"" }
+if ($Username)    { $agentArgs += " --username `"$Username`" --password `"$Password`"" }
+if ($ObsPassword) { $agentArgs += " --obs-password `"$ObsPassword`" --obs-url `"$ObsUrl`"" }
 $action   = New-ScheduledTaskAction -Execute "$dir\stream-agent.exe" -Argument $agentArgs -WorkingDirectory $dir
 $trigger  = New-ScheduledTaskTrigger -AtStartup
 $settings = New-ScheduledTaskSettingsSet -RestartCount 99 -RestartInterval (New-TimeSpan -Minutes 1) `

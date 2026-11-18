@@ -25,6 +25,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/dev-a4b/stream-monitor/agent/obs"
 	"github.com/dev-a4b/stream-monitor/agent/rw"
 	"github.com/shirou/gopsutil/v4/cpu"
 	"github.com/shirou/gopsutil/v4/host"
@@ -56,6 +57,7 @@ type Sample struct {
 	NetErr    float64 `json:"net_err"`
 	LatencyMs float64 `json:"latency_ms"`
 
+	OBS      *obs.Stats   `json:"-"` // OBS figures, nil when OBS is not running
 	Programs []ProgramUse `json:"-"` // top programs, when this reading includes them
 	Gone     []string     `json:"-"` // programs that dropped out of the top since the last reading
 }
@@ -82,6 +84,10 @@ type agent struct {
 	prevNet  map[string]gnet.IOCountersStat
 	prevTime time.Time
 
+	obsClient    *obs.Client
+	obsURL       string
+	obsReporting bool
+
 	progEvery    time.Duration
 	lastProg     time.Time
 	prevProcCPU  map[int32]float64
@@ -104,6 +110,9 @@ func main() {
 	flag.StringVar(&a.server, "server", os.Getenv("STREAM_MONITOR_SERVER"), "custom backend URL (alternative to --remote-write)")
 	flag.DurationVar(&a.interval, "interval", 15*time.Second, "how often to measure")
 	flag.DurationVar(&a.progEvery, "programs-interval", time.Minute, "how often to report the top programs by CPU and memory (0 turns it off)")
+	var obsURL, obsPass string
+	flag.StringVar(&obsURL, "obs-url", envOr("STREAM_OBS_URL", "ws://127.0.0.1:4455"), "OBS WebSocket address")
+	flag.StringVar(&obsPass, "obs-password", os.Getenv("STREAM_OBS_PASSWORD"), "OBS WebSocket password (enables OBS metrics)")
 	flag.BoolVar(&dry, "dry-run", false, "just print readings, do not send anything")
 	flag.Parse()
 
@@ -120,6 +129,11 @@ func main() {
 	a.server = strings.TrimRight(a.server, "/")
 	if a.rwURL == "" && !dry {
 		a.progEvery = 0 // the custom backend has nowhere to put them
+	}
+
+	if obsPass != "" || os.Getenv("STREAM_OBS_ENABLE") != "" {
+		a.obsURL = obsURL
+		a.obsClient = obs.New(obsURL, obsPass, a.interval)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -141,6 +155,10 @@ func (a *agent) run(ctx context.Context, dry bool) {
 			return
 		}
 	}
+	if a.obsClient != nil {
+		go a.obsClient.Run(ctx)
+		log.Printf("also reading OBS at %s", a.obsURL)
+	}
 	// the first reading of a rate needs a starting point, so prime the counters
 	_, _ = cpu.Percent(0, false)
 	a.prevNet, a.prevTime = readNet(), time.Now()
@@ -161,6 +179,14 @@ func (a *agent) run(ctx context.Context, dry bool) {
 		s := a.measure()
 		if dry {
 			fmt.Printf("cpu %.0f%%  memory %.0f%%  up %.0f kbps  down %.0f kbps  errors %.1f/min\n", s.CPU, s.Mem, s.NetUp/1000, s.NetDown/1000, s.NetErr)
+			if a.obsClient != nil {
+				if o := s.OBS; o == nil {
+					fmt.Printf("    OBS: not reachable at %s\n", a.obsURL)
+				} else {
+					fmt.Printf("    OBS: streaming=%v reconnecting=%v  %.0f fps  dropped out/render %.0f/%.0f  congestion %.2f  sent %.1f MB\n",
+						o.Streaming, o.Reconnecting, o.FPS, o.OutputSkippedFrames, o.RenderSkippedFrames, o.Congestion, o.OutputBytes/1e6)
+				}
+			}
 			for _, u := range s.Programs {
 				fmt.Printf("    %-30s cpu %5.1f%%   memory %5.1f%%\n", u.Name, u.CPU, u.Mem)
 			}
@@ -185,6 +211,9 @@ func (a *agent) measure() Sample {
 	if vm, err := mem.VirtualMemory(); err == nil {
 		s.Mem = vm.UsedPercent
 	}
+	if a.obsClient != nil {
+		s.OBS = a.obsClient.Latest()
+	}
 	cur := readNet()
 	dt := now.Sub(a.prevTime).Seconds()
 	if dt > 0 {
@@ -206,6 +235,13 @@ func (a *agent) measure() Sample {
 		s.Programs, s.Gone = a.selectTop(a.readPrograms(now))
 	}
 	return s
+}
+
+func envOr(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
 }
 
 // a counter that went backwards (interface reset) counts as no traffic rather than a huge number
@@ -328,7 +364,58 @@ func (a *agent) buildSeries(batch []Sample) []rw.Series {
 		}
 	}
 	out = append(out, rw.Series{Name: "stream_laptop_info", Labels: info, Samples: []rw.Point{{TS: batch[len(batch)-1].TS * 1000, Value: 1}}})
+	out = append(out, a.obsSeries(base, batch)...)
 	return append(out, a.programSeries(base, batch)...)
+}
+
+// OBS figures, present only while OBS is running with its WebSocket server on. When OBS closes,
+// one "stale" marker ends the series so Grafana stops showing a stream that is no longer live,
+// rather than freezing on the last reading.
+func (a *agent) obsSeries(base []rw.Label, batch []Sample) []rw.Series {
+	metrics := []struct {
+		name string
+		get  func(*obs.Stats) float64
+	}{
+		{"stream_laptop_obs_streaming", func(s *obs.Stats) float64 { return boolVal(s.Streaming) }},
+		{"stream_laptop_obs_reconnecting", func(s *obs.Stats) float64 { return boolVal(s.Reconnecting) }},
+		{"stream_laptop_obs_congestion", func(s *obs.Stats) float64 { return s.Congestion }},
+		{"stream_laptop_obs_output_skipped_frames_total", func(s *obs.Stats) float64 { return s.OutputSkippedFrames }},
+		{"stream_laptop_obs_output_frames_total", func(s *obs.Stats) float64 { return s.OutputTotalFrames }},
+		{"stream_laptop_obs_render_skipped_frames_total", func(s *obs.Stats) float64 { return s.RenderSkippedFrames }},
+		{"stream_laptop_obs_render_frames_total", func(s *obs.Stats) float64 { return s.RenderTotalFrames }},
+		{"stream_laptop_obs_output_bytes_total", func(s *obs.Stats) float64 { return s.OutputBytes }},
+		{"stream_laptop_obs_fps", func(s *obs.Stats) float64 { return s.FPS }},
+		{"stream_laptop_obs_frame_render_time_ms", func(s *obs.Stats) float64 { return s.FrameRenderTimeMs }},
+		{"stream_laptop_obs_disk_free_gb", func(s *obs.Stats) float64 { return s.AvailableDiskGB }},
+		{"stream_laptop_obs_stream_duration_seconds", func(s *obs.Stats) float64 { return s.StreamDurationSecs }},
+	}
+
+	// a final reading with no OBS means it closed during this batch
+	ending := a.obsReporting && batch[len(batch)-1].OBS == nil
+	out := make([]rw.Series, 0, len(metrics))
+	for _, m := range metrics {
+		pts := make([]rw.Point, 0, len(batch))
+		for _, s := range batch {
+			if s.OBS != nil {
+				pts = append(pts, rw.Point{TS: s.TS * 1000, Value: m.get(s.OBS)})
+			}
+		}
+		if ending {
+			pts = append(pts, rw.Point{TS: batch[len(batch)-1].TS * 1000, Value: rw.StaleNaN})
+		}
+		if len(pts) > 0 {
+			out = append(out, rw.Series{Name: m.name, Labels: base, Samples: pts})
+		}
+	}
+	a.obsReporting = batch[len(batch)-1].OBS != nil
+	return out
+}
+
+func boolVal(b bool) float64 {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 // One series per program and metric. A program that drops out of the top gets a final "stale" marker,
