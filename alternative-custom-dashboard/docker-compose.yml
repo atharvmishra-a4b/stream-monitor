@@ -1,0 +1,41 @@
+# Postgres, the backend and the dashboard.
+#   docker compose up --build
+# Dashboard: http://localhost:3000     Backend API: http://localhost:8080
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: monitor
+      POSTGRES_PASSWORD: monitor
+      POSTGRES_DB: monitor
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U monitor"]
+      interval: 3s
+      retries: 20
+
+  backend:
+    build: ./backend
+    environment:
+      DATABASE_URL: postgres://monitor:monitor@postgres:5432/monitor?sslmode=disable
+      CATALOG_SOURCE: ${CATALOG_SOURCE:-seed}          # "seed" = fake hubs and temples, "kratos" = the real ones
+      KRATOS_BASE_URL: ${KRATOS_BASE_URL:-}
+      KRATOS_AUTH_HEADER: ${KRATOS_AUTH_HEADER:-}
+      AGENT_TOKEN: ${AGENT_TOKEN:-}                    # leave empty for local testing
+      RETENTION_DAYS: ${RETENTION_DAYS:-7}
+      STREAM_WINDOWS: ${STREAM_WINDOWS:-}              # empty = 07:00-12:00,16:00-20:00. Use "always" to turn schedule awareness off
+      TIMEZONE: ${TIMEZONE:-Asia/Kolkata}
+      EARLY_MINUTES: ${EARLY_MINUTES:-30}               # laptops should be on this long before a stream starts
+    depends_on:
+      postgres: { condition: service_healthy }
+    ports: ["8080:8080"]
+
+  web:
+    build: ./web
+    environment:
+      BACKEND_URL: http://backend:8080
+    depends_on: [backend]
+    ports: ["3000:3000"]
+
+volumes:
+  pgdata:

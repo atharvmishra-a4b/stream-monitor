@@ -1,0 +1,73 @@
+# Run with:  promtool test rules rules_test.yml
+rule_files: [rules.yml]
+evaluation_interval: 15s
+
+tests:
+  # ---- no schedule configured: laptops are expected online at every hour ----
+  # (when a schedule is restored in rules.yml, restore the hour-by-hour assertions here too)
+  - name: schedule window
+    interval: 15s
+    promql_expr_test:
+      - { expr: stream:window_active, eval_time: 30m,   exp_samples: [{ labels: 'stream:window_active', value: 1 }] }  # 06:00 IST
+      - { expr: stream:window_active, eval_time: 480m,  exp_samples: [{ labels: 'stream:window_active', value: 1 }] }  # 13:30 IST, formerly between streams
+      - { expr: stream:window_active, eval_time: 1320m, exp_samples: [{ labels: 'stream:window_active', value: 1 }] }  # 03:30 IST, night
+
+  # ---- status during a stream (03:00 UTC = 08:30 IST) ----
+  - name: status during a stream
+    interval: 15s
+    input_series:
+      - { series: 'stream_laptop_cpu_percent{hub="H",temple="T",device="fine"}',      values: '30+0x720' }
+      - { series: 'stream_laptop_memory_percent{hub="H",temple="T",device="fine"}',   values: '50+0x720' }
+      - { series: 'stream_laptop_cpu_percent{hub="H",temple="T",device="hot"}',       values: '97+0x720' }
+      - { series: 'stream_laptop_memory_percent{hub="H",temple="T",device="hot"}',    values: '50+0x720' }
+      - { series: 'stream_laptop_cpu_percent{hub="H",temple="T",device="memfull"}',   values: '20+0x720' }
+      - { series: 'stream_laptop_memory_percent{hub="H",temple="T",device="memfull"}', values: '96+0x720' }
+      - { series: 'stream_laptop_cpu_percent{hub="H",temple="T",device="flaky"}',     values: '20+0x720' }
+      - { series: 'stream_laptop_network_errors_per_minute{hub="H",temple="T",device="flaky"}', values: '40+0x720' }
+      # stopped reporting 10 minutes ago
+      - { series: 'stream_laptop_cpu_percent{hub="H",temple="T",device="gone"}',       values: '30+0x680' }
+    promql_expr_test:
+      - expr: stream:laptop_status
+        eval_time: 180m
+        exp_samples:
+          - { labels: 'stream:laptop_status{hub="H",temple="T",device="fine"}',    value: 1 }
+          - { labels: 'stream:laptop_status{hub="H",temple="T",device="hot"}',     value: 2 }
+          - { labels: 'stream:laptop_status{hub="H",temple="T",device="memfull"}', value: 2 }
+          - { labels: 'stream:laptop_status{hub="H",temple="T",device="flaky"}',   value: 2 }
+          - { labels: 'stream:laptop_status{hub="H",temple="T",device="gone"}',    value: 0 }
+    alert_rule_test:
+      - eval_time: 180m
+        alertname: StreamLaptopOffline
+        exp_alerts:               # only the laptop that went quiet 10 minutes ago
+          - exp_labels: { hub: H, temple: T, device: gone, severity: warning, team: streaming }
+            exp_annotations:
+              summary: "gone is not reporting (H / T)"
+              description: "Nothing received for over 90 seconds. Check the laptop is on, online and that the agent is running. No stream schedule is configured yet, so this also fires for laptops switched off deliberately."
+      - eval_time: 180m
+        alertname: StreamLaptopNeedsAttention
+        exp_alerts:               # hot CPU, full memory, flaky network; "fine" stays quiet
+          - exp_labels: { hub: H, temple: T, device: hot, severity: warning, team: streaming }
+            exp_annotations:
+              summary: "hot has a problem (H / T)"
+              description: "CPU over 90%, memory over 93%, network errors over 10 a minute, or slow reports, for 5 minutes. Open the Stream device dashboard for details."
+          - exp_labels: { hub: H, temple: T, device: memfull, severity: warning, team: streaming }
+            exp_annotations:
+              summary: "memfull has a problem (H / T)"
+              description: "CPU over 90%, memory over 93%, network errors over 10 a minute, or slow reports, for 5 minutes. Open the Stream device dashboard for details."
+          - exp_labels: { hub: H, temple: T, device: flaky, severity: warning, team: streaming }
+            exp_annotations:
+              summary: "flaky has a problem (H / T)"
+              description: "CPU over 90%, memory over 93%, network errors over 10 a minute, or slow reports, for 5 minutes. Open the Stream device dashboard for details."
+
+  # ---- with no schedule, a quiet laptop is Offline at any hour (08:00 UTC = 13:30 IST) ----
+  # This used to expect 3 (standby). With the schedule removed there is no "normal" time to be off,
+  # so the same laptop now reports 0 (offline) and will raise StreamLaptopOffline.
+  - name: quiet laptop is offline at any hour
+    interval: 15s
+    input_series:
+      - { series: 'stream_laptop_cpu_percent{hub="H",temple="T",device="asleep"}', values: '30+0x1000' }   # last reading at ~4h10m
+    promql_expr_test:
+      - expr: stream:laptop_status
+        eval_time: 480m
+        exp_samples:
+          - { labels: 'stream:laptop_status{hub="H",temple="T",device="asleep"}', value: 0 }

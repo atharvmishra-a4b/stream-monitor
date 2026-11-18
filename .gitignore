@@ -1,0 +1,7 @@
+node_modules
+.next
+agent/dist
+*.log
+
+# build output / bundles
+stream-agent-windows.zip

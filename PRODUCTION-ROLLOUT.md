@@ -1,0 +1,349 @@
+# Production rollout — first Windows laptop
+
+Two parts: what the **infra engineer** changes on the Prometheus box, and how **you** bring up and test
+the first Windows laptop. Do them in that order — the laptop has nothing to talk to until part A is done.
+
+**Target Prometheus** (verified 2026-11-17):
+
+| | |
+|---|---|
+| Host | `ec2-65-1-25-0.ap-south-1.compute.amazonaws.com` (ap-south-1) |
+| Version | 2.50.1 — supports everything below |
+| Grafana datasource | name `Prometheus`, uid `rrgl-gJSk` (default) |
+| Config file | `/etc/prometheus/prometheus.yml` |
+| Existing rule file | `/etc/prometheus/alert.rules` |
+| Alertmanager | `alertmanager:9093`, already wired up |
+| Runs as | Docker Compose on the EC2 box |
+
+> **Auth is deliberately deferred.** Per the infra decision, the write endpoint goes up unauthenticated
+> for now and auth lands later across everything. Consequences while that's true, so nobody is surprised:
+> anyone on the internet can write arbitrary metrics into this Prometheus, and laptop readings travel in
+> plaintext over HTTP. Port 9090 is **already** publicly reachable and unauthenticated for reads today,
+> so this widens an existing exposure rather than creating a new one. Revisit at the auth rollout.
+
+---
+
+## Part A — Prometheus changes (infra engineer)
+
+### A1. Enable the remote-write receiver
+
+This is the blocker. Right now `POST /api/v1/write` returns **404** and no laptop can send anything.
+
+In the Prometheus service definition in `docker-compose.yml`, add one flag:
+
+```yaml
+services:
+  prometheus:
+    image: prom/prometheus:v2.50.1
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --web.enable-remote-write-receiver     # <-- ADD THIS
+      # ... keep every existing flag exactly as-is
+```
+
+**This one needs a real restart** — it is a process flag, not config. `SIGHUP` will not pick it up.
+
+### A2. Allow backfill after a laptop is offline
+
+Add this top-level block to `/etc/prometheus/prometheus.yml` (alongside `global:`, `alerting:`,
+`rule_files:` — not nested inside any of them):
+
+```yaml
+storage:
+  tsdb:
+    out_of_order_time_window: 12h
+```
+
+**Why:** the agent buffers ~8 hours of readings when a temple's internet drops and replays them with
+their original timestamps. With out-of-order ingestion disabled (the current state), Prometheus only
+accepts samples landing in the active head block (~2h) and silently rejects the rest. Without this,
+an overnight outage loses most of its history. 12h comfortably covers the agent's buffer.
+
+### A3. Add the recording and alerting rules
+
+**These are mandatory, not optional.** The dashboards query `stream:laptop_status` 25 times — without
+the rules both dashboards render completely empty even when data is arriving.
+
+1. Copy `stack/prometheus/rules.yml` from this repo to the host and mount it at
+   `/etc/prometheus/stream-rules.yml` (same volume as the existing `alert.rules`).
+2. Append it to `rule_files` in `prometheus.yml`:
+
+```yaml
+rule_files:
+- /etc/prometheus/alert.rules          # existing — leave alone
+- /etc/prometheus/stream-rules.yml     # <-- ADD THIS
+```
+
+What it defines: 4 recording rules (`stream:window_active`, `stream:laptop_last_seen_seconds`,
+`stream:laptop_problem`, `stream:laptop_status`) and 2 alerts (`StreamLaptopOffline`,
+`StreamLaptopNeedsAttention`), both labelled `team: streaming`.
+
+Validate before loading, if promtool is handy:
+```bash
+promtool check rules stack/prometheus/rules.yml
+promtool test rules stack/prometheus/rules_test.yml
+```
+
+### A4. Alert routing
+
+Route `team: streaming` to its own Slack channel in Alertmanager. **Do not route it to the on-call
+paging rotation** — a laptop switched off at a temple is not a production incident.
+
+**There is no stream schedule.** Laptops are treated as expected online at every hour, so
+`StreamLaptopOffline` fires for *any* laptop quiet for 2 minutes — including one deliberately switched
+off overnight. This is the right setting while validating (a dead agent can't hide in "standby"), but
+it means a dedicated, non-paging Slack channel is not optional. Expect nightly noise once several
+temples are live, and restore a schedule before the fleet grows.
+
+#### Restoring a stream schedule later
+
+`stream:window_active` in `rules.yml` is currently `vector(1)` (always on). To bring back time windows,
+replace that expression with the original below. The numbers are minutes after midnight **IST** —
+Prometheus works in UTC, so 330 is added:
+
+| Window | Minutes | Meaning |
+|---|---|---|
+| 06:30–12:00 | 390–720 | stream 07:00–12:00, laptops on from 06:30 |
+| 15:30–20:00 | 930–1200 | stream 16:00–20:00, laptops on from 15:30 |
+
+```yaml
+- record: stream:window_active
+  expr: |
+    (vector(1) and on() (((hour() * 60 + minute() + 330) % 1440) >= 390 and ((hour() * 60 + minute() + 330) % 1440) < 720))
+    or
+    (vector(1) and on() (((hour() * 60 + minute() + 330) % 1440) >= 930 and ((hour() * 60 + minute() + 330) % 1440) < 1200))
+    or
+    vector(0)
+```
+
+Restoring this makes the Standby status (3) reachable again. If you do, also revisit the fleet
+dashboard — the Standby stat tile and the Hubs table's Standby column were removed when the schedule
+was dropped. The `StreamLaptopOffline` description text also mentions that no schedule is configured.
+
+### A5. Restart and verify
+
+```bash
+docker compose up -d prometheus      # restart picks up the new flag
+```
+
+Then, from anywhere:
+
+```bash
+# 1. receiver is live — expect 400 (not 404). 400 means "endpoint exists, bad body", which is correct.
+curl -s -o /dev/null -w "%{http_code}\n" -X POST \
+  http://ec2-65-1-25-0.ap-south-1.compute.amazonaws.com:9090/api/v1/write
+
+# 2. flag is actually set — expect "true"
+curl -s http://ec2-65-1-25-0.ap-south-1.compute.amazonaws.com:9090/api/v1/status/flags \
+  | tr ',' '\n' | grep remote-write-receiver
+
+# 3. rules loaded — expect the 4 stream: rules listed
+curl -s http://ec2-65-1-25-0.ap-south-1.compute.amazonaws.com:9090/api/v1/rules \
+  | tr ',' '\n' | grep 'stream:'
+
+# 4. the other 236 targets still scraping normally
+curl -s 'http://ec2-65-1-25-0.ap-south-1.compute.amazonaws.com:9090/api/v1/query?query=count(up)'
+```
+
+Step 4 matters: ~18 targets were already failing before this change (including the `prometheus`
+self-scrape, `bff`, `neo`, `herald`, `hop`, `otel`). **Record the exact count before restarting** so a
+pre-existing failure isn't mistaken for fallout from this change.
+
+### A6. Rollback
+
+Remove the `--web.enable-remote-write-receiver` flag and restart. Nothing else is load-bearing —
+the rules only create new `stream:*` series and the `storage:` block is inert without incoming data.
+No existing scrape job, alert, or dashboard is touched by any of this.
+
+---
+
+## Part B — First Windows laptop
+
+### What to copy over
+
+From this repo, after running `agent/build.sh`:
+
+- `agent/dist/stream-agent-windows.exe`
+- `agent/install-windows.ps1`
+
+### The URL to use
+
+```
+http://ec2-65-1-25-0.ap-south-1.compute.amazonaws.com:9090/api/v1/write
+```
+
+Note it is **`http`**, port **`9090`**, and there is **no** `-Username` / `-Password` until auth lands.
+Omit those parameters entirely — the installer only adds the flags if a username is supplied.
+
+### Step 1 — Put the files in place
+
+```powershell
+New-Item -Path "C:\StreamMonitor" -ItemType Directory -Force
+
+Copy-Item -Path "$env:USERPROFILE\Downloads\stream-agent-windows.exe", `
+                "$env:USERPROFILE\Downloads\install-windows.ps1" `
+          -Destination "C:\StreamMonitor"
+
+cd C:\StreamMonitor
+
+# Windows tags downloaded files and will refuse to run the script otherwise
+Unblock-File .\install-windows.ps1
+Unblock-File .\stream-agent-windows.exe
+```
+
+If the script still refuses to run, allow it for this session only:
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+```
+
+### Step 2 — Check the clock
+
+Readings with a skewed clock get rejected or render wrong. Settings → Time & language → **Sync now**.
+
+```powershell
+w32tm /resync
+Get-Date   # sanity-check against your phone
+```
+
+### Step 3 — Dry run (sends nothing)
+
+Confirms the binary runs on this hardware before any network is involved:
+
+```powershell
+.\stream-agent-windows.exe --dry-run
+```
+
+Expect a line every 15s: `cpu 12%  memory 48%  up 30 kbps  down 110 kbps  errors 0.0/min`, plus the
+top programs once a minute. `Ctrl+C` to stop.
+
+SmartScreen may block it here — the exe is unsigned. Allow it via **More info → Run anyway**, or
+sign it if your policy requires.
+
+### Step 4 — Foreground run (the real test)
+
+Run it by hand first, so you see errors directly instead of hunting through Task Scheduler:
+
+```powershell
+.\stream-agent-windows.exe `
+  --remote-write "http://ec2-65-1-25-0.ap-south-1.compute.amazonaws.com:9090/api/v1/write" `
+  --hub "Ujjain" `
+  --temple "Mahakal temple" `
+  --name "Main hall 1"
+```
+
+Expect one line and then silence:
+```
+sending to http://ec2-65-1-25-0...:9090/api/v1/write as Ujjain / Mahakal temple / Main hall 1
+```
+
+**Silence is success.** The agent only logs again on failure. If you see repeated errors:
+
+| Message | Cause |
+|---|---|
+| `server said 404` | A1 not done, or Prometheus not restarted |
+| `server said 400 ... out of bounds` | Clock skew (step 2), or A2 not done |
+| connection timeout | Temple firewall blocking outbound to port 9090 |
+
+Leave it running for the next step.
+
+### Step 5 — Confirm the data arrived
+
+From your Mac, or any browser:
+
+```bash
+curl -s 'http://ec2-65-1-25-0.ap-south-1.compute.amazonaws.com:9090/api/v1/query' \
+  --data-urlencode 'query=stream_laptop_cpu_percent'
+```
+
+You should see your `hub`, `temple` and `device` labels. Then check the derived status is computing —
+this proves A3 worked:
+
+```bash
+curl -s 'http://ec2-65-1-25-0.ap-south-1.compute.amazonaws.com:9090/api/v1/query' \
+  --data-urlencode 'query=stream:laptop_status'
+```
+
+Expect `1` (healthy) — at any hour, since no stream schedule is configured. If the agent has been
+stopped for more than 90s you'll get `0` (offline) instead.
+
+Now `Ctrl+C` the foreground agent.
+
+### Step 6 — Install as a scheduled task
+
+Only once steps 4 and 5 passed. In an **elevated** PowerShell (Run as Administrator):
+
+```powershell
+cd C:\StreamMonitor
+
+.\install-windows.ps1 `
+  -RemoteWrite "http://ec2-65-1-25-0.ap-south-1.compute.amazonaws.com:9090/api/v1/write" `
+  -Hub "Ujjain" `
+  -Temple "Mahakal temple" `
+  -Name "Main hall 1"
+```
+
+This copies the exe to `C:\ProgramData\StreamMonitor\`, registers the `StreamMonitorAgent` task to run
+as SYSTEM at startup, restarts it on failure (99 retries, 1 min apart), and starts it immediately.
+
+> This installer has **never been run on a real Windows machine**. Expect to debug it on this first
+> laptop — that is the point of doing one before the rest.
+
+Verify:
+```powershell
+Get-ScheduledTask -TaskName StreamMonitorAgent
+Get-ScheduledTaskInfo -TaskName StreamMonitorAgent    # LastTaskResult 0 = running fine
+Get-Process stream-agent -ErrorAction SilentlyContinue
+```
+
+### Step 7 — Reboot test
+
+The whole point is surviving an unattended restart at a temple:
+
+```powershell
+Restart-Computer
+```
+
+After it comes back, **without logging in if possible**, re-run the step 5 query and confirm fresh
+data. The timestamp should be within ~30s.
+
+### Removal
+
+```powershell
+Unregister-ScheduledTask -TaskName StreamMonitorAgent -Confirm:$false
+Remove-Item -Recurse C:\ProgramData\StreamMonitor
+```
+
+---
+
+## Part C — Grafana
+
+Import both dashboards from `stack/grafana/dashboards/`:
+
+1. Dashboards → New → Import → upload `streaming-laptops.json`, then `streaming-laptop.json`
+2. For the datasource prompt, pick **`Prometheus`** (uid `rrgl-gJSk`)
+3. Suggest a new `Streaming` folder — the only existing folders are `Data Platform` and `Infra`
+
+The dashboards use a `${datasource}` template variable, so no JSON editing is needed.
+
+---
+
+## Naming — decide before laptop #2
+
+`hub` + `temple` + `name` become Prometheus labels, and the combination **must be unique per laptop**.
+Two laptops sharing all three will silently overwrite each other's series, which looks like one
+flickering machine rather than an error.
+
+Agree the convention now (e.g. `Hub = city`, `Temple = official temple name`, `Name = physical position`)
+and keep a list. Renaming later means re-running the installer, and the old name lingers in history
+until it ages out — currently ~15 days, since retention is at the default.
+
+## Scale
+
+~30 series per laptop (7 readings + up to 20 top-programs + 1 info). 15 laptops ≈ 450 series against
+an instance already handling 237 scrape targets. Negligible.
+
+## Changed in this repo
+
+`agent/install-windows.ps1` — renamed the internal `$args` variable to `$agentArgs`. `$args` is a
+PowerShell automatic variable; assigning to it is legal but shadows the builtin. Untested locally
+(no PowerShell on macOS), so this removes one avoidable unknown from tomorrow.

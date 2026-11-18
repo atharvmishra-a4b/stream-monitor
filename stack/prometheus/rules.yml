@@ -1,0 +1,49 @@
+groups:
+  - name: stream-laptops
+    interval: 15s
+    rules:
+      - record: stream:window_active
+        expr: vector(1)
+
+      - record: stream:laptop_last_seen_seconds
+        expr: |
+          (time() - timestamp(stream_laptop_cpu_percent))
+          or
+          (time() - max_over_time(timestamp(stream_laptop_cpu_percent)[1d:1m]))
+
+      - record: stream:laptop_problem
+        expr: |
+          max by (hub, temple, device) (
+               (last_over_time(stream_laptop_cpu_percent[2m]) > 90)
+            or (last_over_time(stream_laptop_memory_percent[2m]) > 93)
+            or (last_over_time(stream_laptop_network_errors_per_minute[2m]) > 10)
+            or (last_over_time(stream_laptop_report_latency_ms[2m]) > 1500)
+          )
+
+      - record: stream:laptop_status
+        expr: |
+          ((stream:laptop_last_seen_seconds <= 90) * 0 + 2 and on (hub, temple, device) stream:laptop_problem)
+          or
+          ((stream:laptop_last_seen_seconds <= 90) * 0 + 1)
+          or
+          ((stream:laptop_last_seen_seconds > 90) * 0 and on () (stream:window_active == 1))
+          or
+          ((stream:laptop_last_seen_seconds > 90) * 0 + 3)
+
+  - name: stream-laptop-alerts
+    rules:
+      - alert: StreamLaptopOffline
+        expr: stream:laptop_status == 0
+        for: 2m
+        labels: { severity: warning, team: streaming }
+        annotations:
+          summary: "{{ $labels.device }} is not reporting ({{ $labels.hub }} / {{ $labels.temple }})"
+          description: "Nothing received for over 90 seconds. Check the laptop is on, online and that the agent is running. No stream schedule is configured yet, so this also fires for laptops switched off deliberately."
+
+      - alert: StreamLaptopNeedsAttention
+        expr: stream:laptop_status == 2
+        for: 5m
+        labels: { severity: warning, team: streaming }
+        annotations:
+          summary: "{{ $labels.device }} has a problem ({{ $labels.hub }} / {{ $labels.temple }})"
+          description: "CPU over 90%, memory over 93%, network errors over 10 a minute, or slow reports, for 5 minutes. Open the Stream device dashboard for details."

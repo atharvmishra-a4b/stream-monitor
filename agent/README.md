@@ -1,0 +1,46 @@
+# Agent
+
+One small program per laptop (about 6 MB, nothing else to install). Every 15 seconds it measures **CPU, memory and network**
+(upload, download, interface errors and dropped packets, and how long its report took to send) and pushes them to Prometheus.
+Once a minute it also reports the **top 5 programs by CPU and by memory**, grouped by name, so Grafana can show what is using a struggling laptop.
+Only program names are sent (for example `obs64.exe`), never window titles, files or command lines.
+If the connection drops it keeps up to about 8 hours of readings and sends them when it is back.
+
+The hub, temple and laptop name you give it become labels on every reading. Grafana uses them for its Hub, Temple and Laptop pickers.
+
+## Run it (testing)
+
+```bash
+# no install needed if you have Go:
+go run . --remote-write http://localhost:9090/api/v1/write --hub Ujjain --temple "Test temple" --name "My Mac"
+
+# or use a prebuilt file from dist/ (see "Build"):
+./dist/stream-agent-mac-arm64 --remote-write http://localhost:9090/api/v1/write --hub Ujjain --temple "Test temple" --name "My Mac"
+```
+Just want to see the numbers without sending anything? Use `--dry-run`.
+
+Options: `--remote-write`, `--hub`, `--temple`, `--name` (default: the computer's name), `--username` and `--password`
+(or `STREAM_RW_PASSWORD`) if the Prometheus address needs a login, `--token` for a bearer token, `--interval` (default 15s), `--programs-interval` (default 1m, `0` turns the top-programs report off).
+
+Each laptop needs a **unique** hub + temple + name combination. Two laptops with the same labels would overwrite each other.
+To move a laptop to another temple or rename it, run the agent again (or reinstall) with the new values.
+
+macOS blocks downloaded programs it does not recognise. If it refuses to open, run
+`xattr -d com.apple.quarantine dist/stream-agent-mac-arm64` once.
+
+## Fake laptops for trying the dashboards
+
+`go run ./cmd/fleet-sim` pushes seven pretend laptops (healthy, CPU maxed out, memory full, flaky network, switched off) to the same address.
+
+## Build
+
+`./build.sh` writes `dist/stream-agent-windows.exe`, `-mac-arm64`, `-mac-intel` and `-linux` (no dependencies).
+
+## Install on a Windows laptop
+
+Copy `stream-agent-windows.exe` and `install-windows.ps1` to the laptop and, in an elevated PowerShell:
+
+```powershell
+.\install-windows.ps1 -RemoteWrite https://<prometheus>/api/v1/write -Hub "Ujjain" -Temple "Temple A" -Name "Main hall 1" -Username <user> -Password <password>
+```
+It starts with Windows and restarts itself if it stops. The laptop only needs outbound HTTPS, and its clock must be correct.
