@@ -11,7 +11,7 @@ import (
 )
 
 var (
-	chanRe   = regexp.MustCompile(`^(\S+)\s*\(([^,)]+)`)       // "149 (5GHz, 80MHz)" -> 149, 5GHz
+	chanRe   = regexp.MustCompile(`^(\S+)\s*\(([^,)]+)`)         // "149 (5GHz, 80MHz)" -> 149, 5GHz
 	signalRe = regexp.MustCompile(`(-?\d+)\s*dBm\s*/\s*(-?\d+)`) // "-66 dBm / -95 dBm"
 )
 
@@ -23,7 +23,7 @@ func Read() *Link {
 
 	out, err := exec.CommandContext(ctx, "system_profiler", "SPAirPortDataType").Output()
 	if err != nil {
-		return nil
+		return wiredDarwin()
 	}
 
 	// Only the block under "Current Network Information:" is the association we are on;
@@ -31,14 +31,14 @@ func Read() *Link {
 	text := string(out)
 	start := strings.Index(text, "Current Network Information:")
 	if start < 0 {
-		return nil
+		return wiredDarwin()
 	}
 	text = text[start:]
 	if end := strings.Index(text, "Other Local Wi-Fi Networks:"); end > 0 {
 		text = text[:end]
 	}
 
-	l := &Link{}
+	l := &Link{Kind: KindWifi}
 	for i, line := range strings.Split(text, "\n") {
 		k, v, ok := strings.Cut(line, ":")
 		if !ok {
@@ -66,9 +66,30 @@ func Read() *Link {
 		}
 	}
 	if l.TxMbps == 0 && l.SignalDBm == 0 {
-		return nil
+		return wiredDarwin()
 	}
 	return l
+}
+
+// wiredDarwin reports an active wired adapter, so a Mac on a cable is described rather than
+// reported as nothing. Used for development; the fleet is Windows.
+func wiredDarwin() *Link {
+	ctx, cancel := context.WithTimeout(context.Background(), readTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "ifconfig").Output()
+	if err != nil {
+		return Unknown("could not list interfaces")
+	}
+	name := ""
+	for _, block := range strings.Split(string(out), "\n") {
+		if strings.HasPrefix(block, "en") && strings.Contains(block, "flags=") {
+			name = strings.TrimSuffix(strings.Fields(block)[0], ":")
+		}
+		if name != "" && strings.Contains(block, "status: active") {
+			return Wired(name, 0)
+		}
+	}
+	return Unknown("no connected wired or wireless adapter found")
 }
 
 func parseFloat(s string) float64 {

@@ -222,8 +222,15 @@ func (a *agent) run(ctx context.Context, dry bool) {
 				}
 			}
 			if w := s.Wifi; w != nil {
-				fmt.Printf("    wifi: %s  %s %s  tx %.0f / rx %.0f Mbps  signal %.0f%% %.0f dBm\n",
-					w.SSID, w.Radio, w.Band, w.TxMbps, w.RxMbps, w.SignalPercent, w.SignalDBm)
+				switch w.Kind {
+				case wifi.KindWifi:
+					fmt.Printf("    link: wifi  %s  %s %s  tx %.0f / rx %.0f Mbps  signal %.0f%% %.0f dBm\n",
+						w.SSID, w.Radio, w.Band, w.TxMbps, w.RxMbps, w.SignalPercent, w.SignalDBm)
+				case wifi.KindEthernet:
+					fmt.Printf("    link: wired  adapter %q  link speed %.0f Mbps\n", w.Adapter, w.TxMbps)
+				default:
+					fmt.Printf("    link: unknown (%s)\n", w.Reason)
+				}
 			}
 			if a.obsClient != nil {
 				if o := s.OBS; o == nil {
@@ -470,8 +477,12 @@ func (a *agent) speedSeries(base []rw.Label, batch []Sample) []rw.Series {
 	return out
 }
 
-// Wi-Fi link quality: how much room the connection has, as opposed to how much is being used.
-// Absent on a wired laptop, or where the OS tool cannot be read.
+// How this laptop is attached to the network, and how much room that connection has.
+//
+// Covers wired links as well as Wi-Fi: a temple on a cable and a temple on Wi-Fi appear in the same
+// series, told apart by the "kind" label. A laptop whose connection could not be read is reported
+// as kind="unknown" with a reason rather than as nothing at all, because silence would be
+// indistinguishable from a laptop that is simply wired.
 func (a *agent) wifiSeries(base []rw.Label, batch []Sample) []rw.Series {
 	metrics := []struct {
 		name string
@@ -489,8 +500,8 @@ func (a *agent) wifiSeries(base []rw.Label, batch []Sample) []rw.Series {
 	for _, m := range metrics {
 		pts := make([]rw.Point, 0, len(batch))
 		for _, s := range batch {
-			// a platform that does not report a field leaves it zero; skip rather than
-			// publish a flat zero that reads as "no signal"
+			// a platform or link type that does not report a field leaves it zero; skip rather
+			// than publish a flat zero that reads as "no signal"
 			if s.Wifi != nil && m.get(s.Wifi) != 0 {
 				pts = append(pts, rw.Point{TS: s.TS * 1000, Value: m.get(s.Wifi)})
 			}
@@ -502,10 +513,21 @@ func (a *agent) wifiSeries(base []rw.Label, batch []Sample) []rw.Series {
 			out = append(out, rw.Series{Name: m.name, Labels: base, Samples: pts})
 		}
 	}
-	// which network, band and channel: a drop to 2.4 GHz or a roam to another AP explains a lot
+
+	// One row per laptop describing the connection, whatever its kind. For Wi-Fi a drop to 2.4 GHz
+	// or a roam to another access point shows up here; for Ethernet it records that the laptop is
+	// on a cable, which is otherwise invisible.
 	if l := last.Wifi; l != nil {
 		info := append([]rw.Label(nil), base...)
-		for _, kv := range [][2]string{{"ssid", l.SSID}, {"radio", l.Radio}, {"band", l.Band}, {"channel", l.Channel}} {
+		for _, kv := range [][2]string{
+			{"kind", string(l.Kind)},
+			{"adapter", l.Adapter},
+			{"ssid", l.SSID},
+			{"radio", l.Radio},
+			{"band", l.Band},
+			{"channel", l.Channel},
+			{"reason", l.Reason},
+		} {
 			if kv[1] != "" {
 				info = append(info, rw.Label{Name: kv[0], Value: kv[1]})
 			}

@@ -39,20 +39,33 @@ Two things to know before turning it on:
 One connection cannot fill a modern line, so four run in parallel and the first 500 ms are excluded
 from the timing.
 
-## Wi-Fi link quality
+## How the laptop is connected
 
 The network figures above measure bytes actually moved. They cannot tell a healthy idle link from a
 crippled one: a laptop sending 24 Mbit/s looks the same whether the Wi-Fi has 2400 Mbps of headroom
-or 43. The agent therefore also reads the **negotiated link rate and signal strength** every 30s
-(`--wifi-interval`, `0` turns it off). It costs no network traffic and never competes with a stream.
+or 43. The agent therefore also reads **how the laptop is attached and how fast that link is**, every
+30s (`--wifi-interval`, `0` turns it off). It costs no network traffic and never competes with a stream.
 
-`stream_laptop_wifi_tx_rate_mbps`, `..._rx_rate_mbps`, `..._signal_percent` (Windows),
-`..._signal_dbm` (macOS), plus `stream_laptop_wifi_info` carrying `ssid`, `radio`, `band` and
-`channel` labels, so a drop to 2.4 GHz or a roam to a different access point is visible.
+`stream_laptop_wifi_info` describes the connection for **every** laptop, wired or wireless, told
+apart by its `kind` label:
 
-Fields a platform does not report are simply absent rather than reported as zero. On Windows this
-reads `netsh wlan show interfaces`, whose labels are **localised**: on a non-English Windows the
-metrics will be missing. Check with `netsh wlan show interfaces`.
+| `kind` | Labels | Numeric metrics |
+|---|---|---|
+| `wifi` | `adapter`, `ssid`, `radio`, `band`, `channel` | tx/rx rate, signal |
+| `ethernet` | `adapter` | tx/rx rate (the link speed) |
+| `unknown` | `reason` | none |
+
+A temple on a cable and a temple on Wi-Fi therefore appear side by side. `kind="unknown"` exists so
+that a laptop whose connection could not be read is never mistaken for one that is simply wired.
+
+Numeric series: `stream_laptop_wifi_tx_rate_mbps`, `..._rx_rate_mbps`, `..._signal_percent`
+(Windows), `..._signal_dbm` (macOS). Fields a platform or link type does not report are absent
+rather than zero — a wired link has no signal strength, and reporting `0` would read as "no signal".
+
+On Windows the Wi-Fi details come from `netsh wlan show interfaces`, whose labels are localised. If
+that yields nothing the agent falls back to PowerShell's `Get-NetAdapter`, whose JSON property names
+are English whatever the display language — so a non-English Windows still reports its link, just
+without the Wi-Fi specifics.
 
 ## OBS metrics (optional)
 
