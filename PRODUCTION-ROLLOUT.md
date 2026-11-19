@@ -215,6 +215,37 @@ Moving a laptop from sandbox to production later just means re-running `install-
 production URL; it unregisters and re-registers the scheduled task. Note the readings already sent to
 sandbox stay there — history does not follow the laptop across environments.
 
+### Every option, both ways
+
+The installer builds the exe's command line and hands it to Task Scheduler, so the two take the same
+settings under different naming conventions. Use the **exe** to test by hand, the **installer** to
+make it permanent.
+
+| Installer (`.ps1`) | Agent (`.exe`) | Default | What it does |
+|---|---|---|---|
+| `-RemoteWrite` | `--remote-write` | — | Prometheus write URL (required) |
+| `-Hub` | `--hub` | — | hub name (required) |
+| `-Temple` | `--temple` | — | temple name (required) |
+| `-Name` | `--name` | computer name | laptop name |
+| `-Interval` | `--interval` | `15s` | how often to measure |
+| `-WifiInterval` | `--wifi-interval` | `30s` | Wi-Fi link rate; `0` off |
+| `-SpeedtestInterval` | `--speedtest-interval` | `0` (off) | measured download speed, e.g. `1m` |
+| `-SpeedtestBytes` | `--speedtest-bytes` | `10` | MB per speed test |
+| `-ObsPassword` | `--obs-password` | — | enables OBS metrics |
+| `-ObsUrl` | `--obs-url` | `ws://127.0.0.1:4455` | OBS WebSocket address |
+| `-Username` / `-Password` | `--username` / `--password` | — | not needed until auth lands |
+| — | `--programs-interval` | `1m` | top programs; `0` off |
+| — | `--dry-run` | — | print readings, send nothing (exe only) |
+
+Only the exe has `--dry-run`. Only the installer registers a scheduled task.
+
+| | Running the exe | Running the installer |
+|---|---|---|
+| Survives a reboot | **no** | yes (SYSTEM task, at startup) |
+| Restarts after a crash | no | yes, 99 retries |
+| Where errors appear | on screen | Task Scheduler |
+| Needs an elevated shell | no | **yes** |
+
 ### Step 1 — Put the files in place
 
 ```powershell
@@ -253,8 +284,18 @@ Confirms the binary runs on this hardware before any network is involved:
 .\stream-agent-windows.exe --dry-run
 ```
 
-Expect a line every 15s: `cpu 12%  memory 48%  up 30 kbps  down 110 kbps  errors 0.0/min`, plus the
-top programs once a minute. `Ctrl+C` to stop.
+Expect a line every 15s: `cpu 12%  memory 48%  up 30 kbps  down 110 kbps  errors 0.0/min`, a `wifi:`
+line, and the top programs once a minute. `Ctrl+C` to stop.
+
+If you intend to enable the speed test, prove it here before committing to the data it costs:
+
+```powershell
+.\stream-agent-windows.exe --dry-run --speedtest-interval 30s --speedtest-bytes 10
+```
+
+Within about 40 seconds you want `speed test: 142.3 Mbit/s  (10 MB in 0.9s, 0 failures)`.
+`no successful measurement yet` with a rising failure count means the endpoint is unreachable from
+this network — worth knowing now rather than from inside a scheduled task.
 
 SmartScreen may block it here — the exe is unsigned. Allow it via **More info → Run anyway**, or
 sign it if your policy requires.
@@ -267,10 +308,15 @@ Run it by hand first, so you see errors directly instead of hunting through Task
 .\stream-agent-windows.exe `
   --remote-write "$PROM/api/v1/write" `
   --hub "Ujjain" `
-  --temple "Mahakal temple" `
+  --temple "Khedapati Hanuman temple" `
   --name "Main hall 1" `
-  --interval 5s
+  --interval 5s `
+  --speedtest-interval 1m --speedtest-bytes 10
 ```
+
+Drop the last line to leave the speed test off. The hub, temple and name strings must match
+**exactly** what you intend to keep: they become Prometheus labels, and a changed capitalisation
+creates a second, permanently-offline laptop.
 
 Expect one line and then silence:
 ```
@@ -319,10 +365,15 @@ cd C:\StreamMonitor
 .\install-windows.ps1 `
   -RemoteWrite "$PROM/api/v1/write" `
   -Hub "Ujjain" `
-  -Temple "Mahakal temple" `
+  -Temple "Khedapati Hanuman temple" `
   -Name "Main hall 1" `
-  -Interval 5s
+  -Interval 5s `
+  -SpeedtestInterval 1m -SpeedtestBytes 10
 ```
+
+The same settings as step 4, in the installer's naming. Drop the last line to leave the speed test
+off; `-SpeedtestInterval 1m` costs about **14 GB per laptop per day**, so enable it on one laptop
+first and check the usage before rolling it out.
 
 This copies the exe to `C:\ProgramData\StreamMonitor\`, registers the `StreamMonitorAgent` task to run
 as SYSTEM at startup, restarts it on failure (99 retries, 1 min apart), and starts it immediately.
