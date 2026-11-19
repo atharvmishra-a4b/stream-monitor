@@ -33,9 +33,15 @@ import (
 const DefaultURL = "https://speed.cloudflare.com/__down?bytes=%d"
 
 const (
-	warmUp     = 500 * time.Millisecond // ignored, to let the connections reach full speed
-	maxRun     = 60 * time.Second       // a very slow line must not hold the test open forever
-	minMeasure = 100 * time.Millisecond // too short a window to divide by
+	// Timing starts once this fraction of the download has arrived, rather than after a fixed
+	// delay. A fresh TCP connection starts slow, so the opening of a run reads low; skipping a
+	// share of the bytes rather than a number of milliseconds means the same rule works on a
+	// 5 Mbit/s line and a gigabit one. A fixed delay does not: on a fast link the whole download
+	// lands inside it, leaving nothing to measure.
+	warmUpFraction = 0.25
+	pollEvery      = 10 * time.Millisecond
+	maxRun         = 60 * time.Second      // a very slow line must not hold the test open forever
+	minMeasure     = 50 * time.Millisecond // too short a window to divide by
 )
 
 // Result is one completed measurement.
@@ -139,15 +145,30 @@ func (t *Tester) measure(ctx context.Context) (*Result, error) {
 		}()
 	}
 
-	// Let the connections get up to speed, then start timing. Everything received before this
-	// point is deliberately excluded from the rate.
-	select {
-	case <-ctx.Done():
-	case <-time.After(warmUp):
-	}
-	atStart, from := received.Load(), time.Now()
+	// Start timing once the warm-up share has arrived. On a fast line that happens within a few
+	// milliseconds; on a slow one it takes a while. Either way the rest of the run is measured.
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
 
-	wg.Wait()
+	want := int64(float64(t.bytes) * warmUpFraction)
+	var atStart int64
+	from := time.Now()
+waiting:
+	for {
+		select {
+		case <-done:
+			break waiting // whole run finished before the warm-up share: fall back below
+		case <-ctx.Done():
+			break waiting
+		case <-time.After(pollEvery):
+			if received.Load() >= want {
+				atStart, from = received.Load(), time.Now()
+				break waiting
+			}
+		}
+	}
+
+	<-done
 	window := time.Since(from)
 	total := received.Load()
 
@@ -155,16 +176,22 @@ func (t *Tester) measure(ctx context.Context) (*Result, error) {
 	if failed.Load() == int64(t.parallel) {
 		return nil, fmt.Errorf("all %d connections failed", t.parallel)
 	}
-	if window < minMeasure {
-		return nil, fmt.Errorf("finished in %v, too short to measure", window)
+	if total <= 0 {
+		return nil, fmt.Errorf("no data received")
 	}
-	measured := total - atStart
-	if measured <= 0 {
-		return nil, fmt.Errorf("no data in the measured window")
+
+	measured, over := total-atStart, window
+	// A download that finished before the warm-up share was reached is a very fast line, not a
+	// failure. Time the whole run instead: slightly pessimistic, but a reading rather than a gap.
+	if measured <= 0 || window < minMeasure {
+		measured, over = total, time.Since(started)
+	}
+	if over < minMeasure {
+		return nil, fmt.Errorf("finished in %v, too short to measure", over)
 	}
 
 	return &Result{
-		Mbps:     float64(measured) * 8 / window.Seconds() / 1e6,
+		Mbps:     float64(measured) * 8 / over.Seconds() / 1e6,
 		Duration: time.Since(started),
 		Bytes:    total,
 		At:       time.Now(),
