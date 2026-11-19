@@ -9,6 +9,10 @@
 # -Interval defaults to 15s. A shorter interval does not shrink the offline buffer:
 # the agent keeps ~8 hours of readings whatever the interval.
 #
+# -SpeedtestInterval 1m downloads 10 MB a minute and reports the real download speed, so a weak
+# connection is visible even when nothing else is using it. That is about 14 GB per laptop per day:
+# raise the interval or lower -SpeedtestBytes to cut it. 0 (the default) turns it off entirely.
+#
 # -ObsPassword turns on OBS metrics (dropped frames, reconnects, real stream bitrate). Enable the
 # server first in OBS: Tools > WebSocket Server Settings > Enable WebSocket server. Without it the
 # agent behaves exactly as before, so it is safe to omit on laptops that do not run OBS.
@@ -24,6 +28,8 @@ param(
   [string] $ObsPassword = "",          # OBS > Tools > WebSocket Server Settings; enables OBS metrics
   [string] $ObsUrl = "ws://127.0.0.1:4455",
   [string] $WifiInterval = "30s",      # how often to read the Wi-Fi link rate; 0 turns it off
+  [string] $SpeedtestInterval = "0",   # e.g. 1m to measure real download speed; 0 turns it off
+  [int]    $SpeedtestBytes = 10,       # megabytes per speed test
   [string] $Username = "",
   [string] $Password = "",
   [string] $Exe = "$PSScriptRoot\stream-agent-windows.exe"
@@ -38,7 +44,7 @@ Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyCo
 New-Item -ItemType Directory -Force -Path $dir | Out-Null
 Copy-Item $Exe "$dir\stream-agent.exe" -Force
 
-$agentArgs = "--remote-write `"$RemoteWrite`" --hub `"$Hub`" --temple `"$Temple`" --name `"$Name`" --interval `"$Interval`" --wifi-interval `"$WifiInterval`""
+$agentArgs = "--remote-write `"$RemoteWrite`" --hub `"$Hub`" --temple `"$Temple`" --name `"$Name`" --interval `"$Interval`" --wifi-interval `"$WifiInterval`" --speedtest-interval `"$SpeedtestInterval`" --speedtest-bytes $SpeedtestBytes"
 if ($Username)    { $agentArgs += " --username `"$Username`" --password `"$Password`"" }
 if ($ObsPassword) { $agentArgs += " --obs-password `"$ObsPassword`" --obs-url `"$ObsUrl`"" }
 $action   = New-ScheduledTaskAction -Execute "$dir\stream-agent.exe" -Argument $agentArgs -WorkingDirectory $dir

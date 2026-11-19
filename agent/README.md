@@ -19,6 +19,26 @@ go run . --remote-write http://localhost:9090/api/v1/write --hub Ujjain --temple
 ```
 Just want to see the numbers without sending anything? Use `--dry-run`.
 
+## Measured download speed (optional)
+
+`--speedtest-interval 1m` downloads 10 MB (`--speedtest-bytes`) over 4 parallel connections and
+reports what the line actually delivers, whether or not anything else is using it. This exists for
+one situation: a stream looks wrong, and the people on site report that the connection is fine.
+
+`stream_laptop_speedtest_download_mbps`, `..._duration_seconds`, `..._age_seconds`, and
+`..._failures_total` (a test too slow or too broken to finish is itself a symptom).
+
+Two things to know before turning it on:
+
+- **It costs data.** 10 MB a minute is about **14 GB per laptop per day**. Raise the interval or
+  lower the size to cut it. Off by default.
+- **On a fast line the figure understates.** A 10 MB download finishes before TCP reaches full
+  speed, so a 165 Mbit/s line may read around 90. The error shrinks as the line gets worse, which is
+  where accuracy matters: treat readings as a baseline to compare against, not an exact capacity.
+
+One connection cannot fill a modern line, so four run in parallel and the first 500 ms are excluded
+from the timing.
+
 ## Wi-Fi link quality
 
 The network figures above measure bytes actually moved. They cannot tell a healthy idle link from a

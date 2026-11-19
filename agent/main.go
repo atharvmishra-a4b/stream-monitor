@@ -28,6 +28,7 @@ import (
 
 	"github.com/dev-a4b/stream-monitor/agent/obs"
 	"github.com/dev-a4b/stream-monitor/agent/rw"
+	"github.com/dev-a4b/stream-monitor/agent/speedtest"
 	"github.com/dev-a4b/stream-monitor/agent/wifi"
 	"github.com/shirou/gopsutil/v4/cpu"
 	"github.com/shirou/gopsutil/v4/host"
@@ -91,6 +92,12 @@ type agent struct {
 	obsURL       string
 	obsReporting bool
 
+	speed       *speedtest.Tester
+	speedEvery  time.Duration
+	speedMB     int
+	speedConns  int
+	speedFailed int64
+
 	wifiEvery     time.Duration
 	wifiMu        sync.RWMutex
 	wifiLatest    *wifi.Link
@@ -121,6 +128,12 @@ func main() {
 	var obsURL, obsPass string
 	flag.StringVar(&obsURL, "obs-url", envOr("STREAM_OBS_URL", "ws://127.0.0.1:4455"), "OBS WebSocket address")
 	flag.StringVar(&obsPass, "obs-password", os.Getenv("STREAM_OBS_PASSWORD"), "OBS WebSocket password (enables OBS metrics)")
+	var speedBytes, speedParallel int
+	var speedURL string
+	flag.DurationVar(&a.speedEvery, "speedtest-interval", 0, "how often to measure real download speed (0 turns it off, e.g. 1m)")
+	flag.IntVar(&speedBytes, "speedtest-bytes", 10, "megabytes to download per speed test")
+	flag.IntVar(&speedParallel, "speedtest-parallel", 4, "parallel connections per speed test")
+	flag.StringVar(&speedURL, "speedtest-url", "", "speed test URL with a %d for the byte count (default: Cloudflare)")
 	flag.DurationVar(&a.wifiEvery, "wifi-interval", 30*time.Second, "how often to read the Wi-Fi link rate (0 turns it off)")
 	flag.BoolVar(&dry, "dry-run", false, "just print readings, do not send anything")
 	flag.Parse()
@@ -145,6 +158,11 @@ func main() {
 		a.obsClient = obs.New(obsURL, obsPass, a.interval)
 	}
 
+	if a.speedEvery > 0 {
+		a.speedMB, a.speedConns = speedBytes, speedParallel
+		a.speed = speedtest.New(speedURL, int64(speedBytes)*1_000_000, speedParallel)
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	a.run(ctx, dry)
@@ -166,6 +184,10 @@ func (a *agent) run(ctx context.Context, dry bool) {
 	}
 	if a.wifiEvery > 0 {
 		go a.pollWifi(ctx)
+	}
+	if a.speed != nil {
+		go a.speed.Run(ctx, a.speedEvery)
+		log.Printf("measuring download speed every %v (%d MB, %d connections)", a.speedEvery, a.speedMB, a.speedConns)
 	}
 	if a.obsClient != nil {
 		go a.obsClient.Run(ctx)
@@ -191,6 +213,14 @@ func (a *agent) run(ctx context.Context, dry bool) {
 		s := a.measure()
 		if dry {
 			fmt.Printf("cpu %.0f%%  memory %.0f%%  up %.0f kbps  down %.0f kbps  errors %.1f/min\n", s.CPU, s.Mem, s.NetUp/1000, s.NetDown/1000, s.NetErr)
+			if a.speed != nil {
+				if r := a.speed.Latest(); r != nil {
+					fmt.Printf("    speed test: %.1f Mbit/s  (%d MB in %.1fs, %d failures)\n",
+						r.Mbps, a.speedMB, r.Duration.Seconds(), a.speed.Failures())
+				} else {
+					fmt.Printf("    speed test: no successful measurement yet (%d failures)\n", a.speed.Failures())
+				}
+			}
 			if w := s.Wifi; w != nil {
 				fmt.Printf("    wifi: %s  %s %s  tx %.0f / rx %.0f Mbps  signal %.0f%% %.0f dBm\n",
 					w.SSID, w.Radio, w.Band, w.TxMbps, w.RxMbps, w.SignalPercent, w.SignalDBm)
@@ -408,9 +438,36 @@ func (a *agent) buildSeries(batch []Sample) []rw.Series {
 		}
 	}
 	out = append(out, rw.Series{Name: "stream_laptop_info", Labels: info, Samples: []rw.Point{{TS: batch[len(batch)-1].TS * 1000, Value: 1}}})
+	out = append(out, a.speedSeries(base, batch)...)
 	out = append(out, a.wifiSeries(base, batch)...)
 	out = append(out, a.obsSeries(base, batch)...)
 	return append(out, a.programSeries(base, batch)...)
+}
+
+// Measured download speed: what this laptop can actually pull right now, as opposed to what it
+// happens to be pulling. Reported against the time of the last reading in the batch, so the series
+// steps at the measurement interval rather than the sampling interval.
+func (a *agent) speedSeries(base []rw.Label, batch []Sample) []rw.Series {
+	if a.speed == nil {
+		return nil
+	}
+	ts := batch[len(batch)-1].TS * 1000
+	out := []rw.Series{{
+		// a failed test is a symptom, not a gap: a line too slow or too broken to finish counts
+		Name: "stream_laptop_speedtest_failures_total", Labels: base,
+		Samples: []rw.Point{{TS: ts, Value: float64(a.speed.Failures())}},
+	}}
+	if r := a.speed.Latest(); r != nil {
+		out = append(out,
+			rw.Series{Name: "stream_laptop_speedtest_download_mbps", Labels: base,
+				Samples: []rw.Point{{TS: ts, Value: r.Mbps}}},
+			rw.Series{Name: "stream_laptop_speedtest_duration_seconds", Labels: base,
+				Samples: []rw.Point{{TS: ts, Value: r.Duration.Seconds()}}},
+			rw.Series{Name: "stream_laptop_speedtest_age_seconds", Labels: base,
+				Samples: []rw.Point{{TS: ts, Value: time.Since(r.At).Seconds()}}},
+		)
+	}
+	return out
 }
 
 // Wi-Fi link quality: how much room the connection has, as opposed to how much is being used.
