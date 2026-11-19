@@ -19,6 +19,21 @@ go run . --remote-write http://localhost:9090/api/v1/write --hub Ujjain --temple
 ```
 Just want to see the numbers without sending anything? Use `--dry-run`.
 
+## Wi-Fi link quality
+
+The network figures above measure bytes actually moved. They cannot tell a healthy idle link from a
+crippled one: a laptop sending 24 Mbit/s looks the same whether the Wi-Fi has 2400 Mbps of headroom
+or 43. The agent therefore also reads the **negotiated link rate and signal strength** every 30s
+(`--wifi-interval`, `0` turns it off). It costs no network traffic and never competes with a stream.
+
+`stream_laptop_wifi_tx_rate_mbps`, `..._rx_rate_mbps`, `..._signal_percent` (Windows),
+`..._signal_dbm` (macOS), plus `stream_laptop_wifi_info` carrying `ssid`, `radio`, `band` and
+`channel` labels, so a drop to 2.4 GHz or a roam to a different access point is visible.
+
+Fields a platform does not report are simply absent rather than reported as zero. On Windows this
+reads `netsh wlan show interfaces`, whose labels are **localised**: on a non-English Windows the
+metrics will be missing. Check with `netsh wlan show interfaces`.
+
 ## OBS metrics (optional)
 
 With `--obs-password` the agent also reads OBS Studio over its built-in WebSocket server, which

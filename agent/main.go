@@ -22,11 +22,13 @@ import (
 	"os/signal"
 	"regexp"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/dev-a4b/stream-monitor/agent/obs"
 	"github.com/dev-a4b/stream-monitor/agent/rw"
+	"github.com/dev-a4b/stream-monitor/agent/wifi"
 	"github.com/shirou/gopsutil/v4/cpu"
 	"github.com/shirou/gopsutil/v4/host"
 	"github.com/shirou/gopsutil/v4/mem"
@@ -58,6 +60,7 @@ type Sample struct {
 	LatencyMs float64 `json:"latency_ms"`
 
 	OBS      *obs.Stats   `json:"-"` // OBS figures, nil when OBS is not running
+	Wifi     *wifi.Link   `json:"-"` // Wi-Fi link quality, nil on a wired or unreadable machine
 	Programs []ProgramUse `json:"-"` // top programs, when this reading includes them
 	Gone     []string     `json:"-"` // programs that dropped out of the top since the last reading
 }
@@ -88,6 +91,11 @@ type agent struct {
 	obsURL       string
 	obsReporting bool
 
+	wifiEvery     time.Duration
+	wifiMu        sync.RWMutex
+	wifiLatest    *wifi.Link
+	wifiReporting bool
+
 	progEvery    time.Duration
 	lastProg     time.Time
 	prevProcCPU  map[int32]float64
@@ -113,6 +121,7 @@ func main() {
 	var obsURL, obsPass string
 	flag.StringVar(&obsURL, "obs-url", envOr("STREAM_OBS_URL", "ws://127.0.0.1:4455"), "OBS WebSocket address")
 	flag.StringVar(&obsPass, "obs-password", os.Getenv("STREAM_OBS_PASSWORD"), "OBS WebSocket password (enables OBS metrics)")
+	flag.DurationVar(&a.wifiEvery, "wifi-interval", 30*time.Second, "how often to read the Wi-Fi link rate (0 turns it off)")
 	flag.BoolVar(&dry, "dry-run", false, "just print readings, do not send anything")
 	flag.Parse()
 
@@ -155,6 +164,9 @@ func (a *agent) run(ctx context.Context, dry bool) {
 			return
 		}
 	}
+	if a.wifiEvery > 0 {
+		go a.pollWifi(ctx)
+	}
 	if a.obsClient != nil {
 		go a.obsClient.Run(ctx)
 		log.Printf("also reading OBS at %s", a.obsURL)
@@ -179,6 +191,10 @@ func (a *agent) run(ctx context.Context, dry bool) {
 		s := a.measure()
 		if dry {
 			fmt.Printf("cpu %.0f%%  memory %.0f%%  up %.0f kbps  down %.0f kbps  errors %.1f/min\n", s.CPU, s.Mem, s.NetUp/1000, s.NetDown/1000, s.NetErr)
+			if w := s.Wifi; w != nil {
+				fmt.Printf("    wifi: %s  %s %s  tx %.0f / rx %.0f Mbps  signal %.0f%% %.0f dBm\n",
+					w.SSID, w.Radio, w.Band, w.TxMbps, w.RxMbps, w.SignalPercent, w.SignalDBm)
+			}
 			if a.obsClient != nil {
 				if o := s.OBS; o == nil {
 					fmt.Printf("    OBS: not reachable at %s\n", a.obsURL)
@@ -214,6 +230,11 @@ func (a *agent) measure() Sample {
 	if a.obsClient != nil {
 		s.OBS = a.obsClient.Latest()
 	}
+	if a.wifiEvery > 0 {
+		a.wifiMu.RLock()
+		s.Wifi = a.wifiLatest
+		a.wifiMu.RUnlock()
+	}
 	cur := readNet()
 	dt := now.Sub(a.prevTime).Seconds()
 	if dt > 0 {
@@ -235,6 +256,29 @@ func (a *agent) measure() Sample {
 		s.Programs, s.Gone = a.selectTop(a.readPrograms(now))
 	}
 	return s
+}
+
+// pollWifi refreshes the Wi-Fi reading on its own slower clock. Reading it costs an OS call that
+// can take seconds, and a link rate does not need per-sample resolution, so it must not sit on the
+// measurement path.
+func (a *agent) pollWifi(ctx context.Context) {
+	read := func() {
+		l := wifi.Read()
+		a.wifiMu.Lock()
+		a.wifiLatest = l
+		a.wifiMu.Unlock()
+	}
+	read()
+	tick := time.NewTicker(a.wifiEvery)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+			read()
+		}
+	}
 }
 
 func envOr(key, fallback string) string {
@@ -364,8 +408,56 @@ func (a *agent) buildSeries(batch []Sample) []rw.Series {
 		}
 	}
 	out = append(out, rw.Series{Name: "stream_laptop_info", Labels: info, Samples: []rw.Point{{TS: batch[len(batch)-1].TS * 1000, Value: 1}}})
+	out = append(out, a.wifiSeries(base, batch)...)
 	out = append(out, a.obsSeries(base, batch)...)
 	return append(out, a.programSeries(base, batch)...)
+}
+
+// Wi-Fi link quality: how much room the connection has, as opposed to how much is being used.
+// Absent on a wired laptop, or where the OS tool cannot be read.
+func (a *agent) wifiSeries(base []rw.Label, batch []Sample) []rw.Series {
+	metrics := []struct {
+		name string
+		get  func(*wifi.Link) float64
+	}{
+		{"stream_laptop_wifi_tx_rate_mbps", func(l *wifi.Link) float64 { return l.TxMbps }},
+		{"stream_laptop_wifi_rx_rate_mbps", func(l *wifi.Link) float64 { return l.RxMbps }},
+		{"stream_laptop_wifi_signal_percent", func(l *wifi.Link) float64 { return l.SignalPercent }},
+		{"stream_laptop_wifi_signal_dbm", func(l *wifi.Link) float64 { return l.SignalDBm }},
+	}
+	last := batch[len(batch)-1]
+	ending := a.wifiReporting && last.Wifi == nil
+
+	out := make([]rw.Series, 0, len(metrics)+1)
+	for _, m := range metrics {
+		pts := make([]rw.Point, 0, len(batch))
+		for _, s := range batch {
+			// a platform that does not report a field leaves it zero; skip rather than
+			// publish a flat zero that reads as "no signal"
+			if s.Wifi != nil && m.get(s.Wifi) != 0 {
+				pts = append(pts, rw.Point{TS: s.TS * 1000, Value: m.get(s.Wifi)})
+			}
+		}
+		if ending {
+			pts = append(pts, rw.Point{TS: last.TS * 1000, Value: rw.StaleNaN})
+		}
+		if len(pts) > 0 {
+			out = append(out, rw.Series{Name: m.name, Labels: base, Samples: pts})
+		}
+	}
+	// which network, band and channel: a drop to 2.4 GHz or a roam to another AP explains a lot
+	if l := last.Wifi; l != nil {
+		info := append([]rw.Label(nil), base...)
+		for _, kv := range [][2]string{{"ssid", l.SSID}, {"radio", l.Radio}, {"band", l.Band}, {"channel", l.Channel}} {
+			if kv[1] != "" {
+				info = append(info, rw.Label{Name: kv[0], Value: kv[1]})
+			}
+		}
+		out = append(out, rw.Series{Name: "stream_laptop_wifi_info", Labels: info,
+			Samples: []rw.Point{{TS: last.TS * 1000, Value: 1}}})
+	}
+	a.wifiReporting = last.Wifi != nil
+	return out
 }
 
 // OBS figures, present only while OBS is running with its WebSocket server on. When OBS closes,

@@ -23,6 +23,7 @@ param(
   [string] $Interval = "15s",          # how often to measure, e.g. 5s, 15s, 1m
   [string] $ObsPassword = "",          # OBS > Tools > WebSocket Server Settings; enables OBS metrics
   [string] $ObsUrl = "ws://127.0.0.1:4455",
+  [string] $WifiInterval = "30s",      # how often to read the Wi-Fi link rate; 0 turns it off
   [string] $Username = "",
   [string] $Password = "",
   [string] $Exe = "$PSScriptRoot\stream-agent-windows.exe"
@@ -37,7 +38,7 @@ Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyCo
 New-Item -ItemType Directory -Force -Path $dir | Out-Null
 Copy-Item $Exe "$dir\stream-agent.exe" -Force
 
-$agentArgs = "--remote-write `"$RemoteWrite`" --hub `"$Hub`" --temple `"$Temple`" --name `"$Name`" --interval `"$Interval`""
+$agentArgs = "--remote-write `"$RemoteWrite`" --hub `"$Hub`" --temple `"$Temple`" --name `"$Name`" --interval `"$Interval`" --wifi-interval `"$WifiInterval`""
 if ($Username)    { $agentArgs += " --username `"$Username`" --password `"$Password`"" }
 if ($ObsPassword) { $agentArgs += " --obs-password `"$ObsPassword`" --obs-url `"$ObsUrl`"" }
 $action   = New-ScheduledTaskAction -Execute "$dir\stream-agent.exe" -Argument $agentArgs -WorkingDirectory $dir
