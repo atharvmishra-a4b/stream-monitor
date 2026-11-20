@@ -170,15 +170,13 @@ func main() {
 	flag.BoolVar(&dry, "dry-run", false, "just print readings, do not send anything")
 	flag.Parse()
 
-	if !dry {
-		switch {
-		case a.rwURL != "" && (a.hub == "" || a.temple == ""):
-			fmt.Fprintln(os.Stderr, "With --remote-write you also need --hub and --temple (names, e.g. --hub Ujjain --temple \"Mahakal temple\").")
-			os.Exit(2)
-		case a.rwURL == "" && (a.server == "" || a.temple == ""):
-			fmt.Fprintln(os.Stderr, "Usage: stream-agent --remote-write https://.../api/v1/write --hub <hub> --temple <temple> [--name <laptop>] [--username u --password p]\n       stream-agent --dry-run   (print readings only)")
-			os.Exit(2)
-		}
+	// The destination may come from the shared config, so it cannot be checked yet; hub and temple
+	// identify the laptop and are never taken from there, so they are checked now.
+	if !dry && (a.hub == "" || a.temple == "") {
+		fmt.Fprintln(os.Stderr, "Need --hub and --temple (e.g. --hub Ujjain --temple \"Mahakal temple\").\n"+
+			"The destination can come from --config-url, or be given here with --remote-write.\n"+
+			"       stream-agent --dry-run   (print readings only)")
+		os.Exit(2)
 	}
 	a.server = strings.TrimRight(a.server, "/")
 	if a.rwURL == "" && !dry {
@@ -221,6 +219,10 @@ func main() {
 		if err == nil || a.cfg != nil {
 			a.apply(s, given)
 		}
+	}
+	if !dry && a.rwURL == "" && a.server == "" {
+		fmt.Fprintln(os.Stderr, "No destination: give --remote-write, or a --config-url whose document sets remote_write.")
+		os.Exit(2)
 	}
 	a.run(ctx, dry)
 }
@@ -384,6 +386,9 @@ func defaultStateDir() string {
 func (a *agent) apply(s config.Settings, given map[string]bool) {
 	set := func(name string, ok bool) bool { return ok && !given[name] }
 
+	if set("remote-write", s.RemoteWrite != nil) && *s.RemoteWrite != "" {
+		a.rwURL = *s.RemoteWrite
+	}
 	if set("interval", s.Interval != nil) && s.Interval.Std() > 0 {
 		a.interval = s.Interval.Std()
 	}

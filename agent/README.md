@@ -70,7 +70,7 @@ Ours is at `https://srm-cdn.a4b.io/obs/monitoring_agent.json`:
 }
 ```
 
-Settable: `interval`, `wifi_interval`, `programs_interval`, `speedtest_interval`, `speedtest_bytes`,
+Settable: `remote_write`, `interval`, `wifi_interval`, `programs_interval`, `speedtest_interval`, `speedtest_bytes`,
 `speedtest_parallel`, `speedtest_url`, `graylog_url`, `graylog_token`, `graylog_interval`,
 `obs_log_dir`.
 Per-temple entries override the defaults, because sites genuinely differ: a laptop on gigabit
@@ -85,7 +85,8 @@ Three rules stop a shared file becoming a single point of failure:
 - **A failed fetch is never fatal.** The last good document is cached on disk, so a laptop booting
   while its internet is down starts with the settings it had and keeps measuring.
 - **Identity is never taken from the file.** `hub`, `temple` and `name` come from the install, so a
-  mistake cannot rename the fleet.
+  mistake cannot rename the fleet. Everything else may come from there, including `remote_write`:
+  moving the fleet from sandbox to production is then one edit rather than four reinstalls.
 
 Changes to the speed test, log shipping and the measurement interval apply on the next re-read; the
 rest take effect at the next restart, which for these laptops is the same day.

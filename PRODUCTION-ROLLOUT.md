@@ -223,7 +223,7 @@ make it permanent.
 
 | Installer (`.ps1`) | Agent (`.exe`) | Default | What it does |
 |---|---|---|---|
-| `-RemoteWrite` | `--remote-write` | — | Prometheus write URL (required) |
+| `-RemoteWrite` | `--remote-write` | — | Prometheus write URL; omit to take it from the shared config |
 | `-Hub` | `--hub` | — | hub name (required) |
 | `-Temple` | `--temple` | — | temple name (required) |
 | `-Name` | `--name` | computer name | laptop name |

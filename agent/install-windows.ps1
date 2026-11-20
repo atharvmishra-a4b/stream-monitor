@@ -1,6 +1,11 @@
 # Installs the monitoring agent on a Windows laptop so it starts with Windows and restarts if it stops.
 # Run in an elevated PowerShell, from the folder that holds stream-agent-windows.exe:
 #
+#   .\install-windows.ps1 -Hub "Ujjain" -Temple "Temple A" -Name "Main hall 1" `
+#                         -ConfigUrl https://srm-cdn.a4b.io/obs/monitoring_agent.json
+#
+# Or without a shared config, giving the destination directly:
+#
 #   .\install-windows.ps1 -RemoteWrite https://prometheus.example.org/api/v1/write `
 #                         -Hub "Ujjain" -Temple "Temple A" -Name "Main hall 1" `
 #                         -Interval 5s `
@@ -30,9 +35,9 @@
 # NOTE: not yet run on a real Windows laptop. Try it on one machine first.
 # The laptop's clock must be correct (Windows: Settings > Time & language > Sync now), or readings are rejected.
 param(
-  [Parameter(Mandatory)] [string] $RemoteWrite,
   [Parameter(Mandatory)] [string] $Hub,
   [Parameter(Mandatory)] [string] $Temple,
+  [string] $RemoteWrite = "",          # Prometheus write URL. Blank: take it from the shared config.
   [string] $Name = $env:COMPUTERNAME,
   [string] $Interval = "",             # how often to measure, e.g. 5s. Blank: use the shared config.
   [string] $ObsPassword = "",          # OBS > Tools > WebSocket Server Settings; enables OBS metrics
@@ -56,6 +61,9 @@ param(
 $ErrorActionPreference = "Stop"
 $dir = "C:\ProgramData\StreamMonitor"
 $task = "StreamMonitorAgent"
+if (-not $RemoteWrite -and -not $ConfigUrl) {
+  throw "Give -RemoteWrite, or a -ConfigUrl whose document sets remote_write."
+}
 New-ScheduledTask -Action (New-ScheduledTaskAction -Execute "cmd.exe") | Out-Null   # fails early if not elevated
 
 Stop-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue
@@ -66,7 +74,8 @@ Copy-Item $Exe "$dir\stream-agent.exe" -Force
 # Only pass a flag that was actually given. A flag on the command line deliberately overrides the
 # shared config, so passing one unconditionally would pin that setting to the installer's default
 # and make it impossible to change centrally.
-$agentArgs = "--remote-write `"$RemoteWrite`" --hub `"$Hub`" --temple `"$Temple`" --name `"$Name`""
+$agentArgs = "--hub `"$Hub`" --temple `"$Temple`" --name `"$Name`""
+if ($RemoteWrite)       { $agentArgs += " --remote-write `"$RemoteWrite`"" }
 if ($Interval)          { $agentArgs += " --interval `"$Interval`"" }
 if ($WifiInterval)      { $agentArgs += " --wifi-interval `"$WifiInterval`"" }
 if ($ProgramsInterval)  { $agentArgs += " --programs-interval `"$ProgramsInterval`"" }

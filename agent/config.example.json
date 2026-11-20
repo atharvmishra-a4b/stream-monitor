@@ -1,4 +1,6 @@
 {
+  "remote_write": "https://monitor-sbox.a4b.io:9090/api/v1/write",
+
   "interval": "5s",
   "wifi_interval": "30s",
   "programs_interval": "1m",

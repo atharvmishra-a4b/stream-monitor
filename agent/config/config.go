@@ -48,6 +48,7 @@ func (d Duration) Std() time.Duration { return time.Duration(d) }
 // Settings is every value that may be set centrally. Pointers distinguish "not mentioned" from
 // "set to zero", which matters because zero turns several of these off.
 type Settings struct {
+	RemoteWrite       *string   `json:"remote_write"`
 	Interval          *Duration `json:"interval"`
 	WifiInterval      *Duration `json:"wifi_interval"`
 	ProgramsInterval  *Duration `json:"programs_interval"`
@@ -83,6 +84,9 @@ type File struct {
 // merge lays over on top of base, field by field, ignoring anything over does not mention.
 func merge(base, over Settings) Settings {
 	out := base
+	if over.RemoteWrite != nil {
+		out.RemoteWrite = over.RemoteWrite
+	}
 	if over.Interval != nil {
 		out.Interval = over.Interval
 	}
