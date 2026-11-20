@@ -5,9 +5,11 @@
 // actually working well at this moment", which is the question asked when a stream looks wrong and
 // the people on site report that everything is fine.
 //
-// It downloads a fixed amount over several connections at once. One connection cannot fill a modern
-// line: TCP window size and round-trip time hold a single stream well below the real capacity, so
-// four run in parallel and their throughput is added up.
+// Pointed at a file it downloads the whole thing; pointed at an endpoint that serves an arbitrary
+// number of bytes it asks for a set amount. One connection cannot fill a line to a distant
+// endpoint, because TCP window size and round-trip time hold a single stream well below the real
+// capacity, so several can run in parallel and their throughput is added up. Against a nearby CDN
+// that is unnecessary: one connection saturates the line.
 //
 // The figure is deliberately measured after a short warm-up. A fresh TCP connection starts slow and
 // speeds up, and on a fast line a small download is over before it reaches full speed, which reads
@@ -22,14 +24,19 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
-// DefaultURL is Cloudflare's speed-test endpoint. It serves an arbitrary number of bytes and is
-// close to most networks. It rate-limits bursts, so a failed attempt is recorded rather than
-// reported as a speed of zero.
+// DefaultURL is Cloudflare's speed-test endpoint, which serves however many bytes are asked for.
+//
+// Two shapes of URL are accepted. One containing "%d" is handed the byte count, as Cloudflare's is.
+// Any other URL is treated as a fixed file and fetched with a Range request, so pointing this at an
+// object on your own CDN needs no cooperation from the server beyond range support, which S3 and
+// CloudFront both have. Measuring against your own CDN tests the path that matters, and removes a
+// dependency on somebody else's free endpoint.
 const DefaultURL = "https://speed.cloudflare.com/__down?bytes=%d"
 
 const (
@@ -41,7 +48,7 @@ const (
 	warmUpFraction = 0.25
 	pollEvery      = 10 * time.Millisecond
 	maxRun         = 60 * time.Second      // a very slow line must not hold the test open forever
-	minMeasure     = 50 * time.Millisecond // too short a window to divide by
+	minMeasure     = 10 * time.Millisecond // too short a window to divide by meaningfully
 )
 
 // Result is one completed measurement.
@@ -63,12 +70,23 @@ type Tester struct {
 	failures int64
 }
 
+// New builds a tester. totalBytes of 0 means "whatever the file is": the URL is fetched entire,
+// with one connection, which is the natural way to use an object on your own CDN. A byte count is
+// still needed for an endpoint that generates data on demand, such as Cloudflare's.
 func New(urlFormat string, totalBytes int64, parallel int) *Tester {
 	if urlFormat == "" {
 		urlFormat = DefaultURL
 	}
 	if parallel < 1 {
 		parallel = 4
+	}
+	if strings.Contains(urlFormat, "%d") && totalBytes <= 0 {
+		totalBytes = 10_000_000 // an endpoint serving on demand has to be told how much
+	}
+	if totalBytes <= 0 {
+		// whole-file mode: splitting it across connections would need a byte count, and asking
+		// several connections for the same file would simply download it several times over
+		parallel = 1
 	}
 	return &Tester{
 		urlFormat: urlFormat,
@@ -126,7 +144,7 @@ func (t *Tester) measure(ctx context.Context) (*Result, error) {
 	defer cancel()
 
 	perConn := t.bytes / int64(t.parallel)
-	if perConn < 1 {
+	if t.bytes > 0 && perConn < 1 {
 		perConn = t.bytes
 	}
 
@@ -137,12 +155,12 @@ func (t *Tester) measure(ctx context.Context) (*Result, error) {
 
 	for i := 0; i < t.parallel; i++ {
 		wg.Add(1)
-		go func() {
+		go func(idx int) {
 			defer wg.Done()
-			if err := t.stream(ctx, perConn, &received); err != nil {
+			if err := t.stream(ctx, idx, perConn, &received); err != nil {
 				failed.Add(1)
 			}
-		}()
+		}(i)
 	}
 
 	// Start timing once the warm-up share has arrived. On a fast line that happens within a few
@@ -150,7 +168,12 @@ func (t *Tester) measure(ctx context.Context) (*Result, error) {
 	done := make(chan struct{})
 	go func() { wg.Wait(); close(done) }()
 
+	// With no byte count the size is unknown until the download finishes, so there is nothing to
+	// take a fraction of; the whole run is timed instead.
 	want := int64(float64(t.bytes) * warmUpFraction)
+	if t.bytes <= 0 {
+		want = 1 << 62 // never reached: fall through to timing the whole run
+	}
 	var atStart int64
 	from := time.Now()
 waiting:
@@ -198,19 +221,37 @@ waiting:
 	}, nil
 }
 
-func (t *Tester) stream(ctx context.Context, want int64, received *atomic.Int64) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf(t.urlFormat, want), nil)
+func (t *Tester) stream(ctx context.Context, idx int, want int64, received *atomic.Int64) error {
+	url, byteRange := t.urlFormat, ""
+	switch {
+	case strings.Contains(t.urlFormat, "%d"):
+		url = fmt.Sprintf(t.urlFormat, want) // endpoint that serves a requested number of bytes
+	case want > 0:
+		// A fixed file, with a size asked for: take this connection's slice. With one connection
+		// that is the first `want` bytes; with several, each takes a different stretch so the file
+		// is downloaded once between them rather than once each.
+		lo := int64(idx) * want
+		byteRange = fmt.Sprintf("bytes=%d-%d", lo, lo+want-1)
+	}
+	// no byte count and a fixed file: fetch all of it, no Range header
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return err
 	}
 	req.Header.Set("User-Agent", "stream-agent")
+	if byteRange != "" {
+		req.Header.Set("Range", byteRange)
+	}
 	resp, err := t.client.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
+	// 206 is the expected reply to a Range request; 200 means the server ignored it and is
+	// sending the whole file, which is still usable data.
 	if resp.StatusCode/100 != 2 {
-		return fmt.Errorf("server said %d", resp.StatusCode) // 403 when the endpoint rate-limits
+		return fmt.Errorf("server said %d", resp.StatusCode) // 403 when an endpoint rate-limits
 	}
 
 	buf := make([]byte, 64*1024)

@@ -1,0 +1,14 @@
+{
+  "interval": "5s",
+  "wifi_interval": "30s",
+  "programs_interval": "1m",
+
+  "speedtest_interval": "1m",
+  "speedtest_parallel": 1,
+  "speedtest_url": "https://srm-cdn.a4b.io/test/obs_network_bandwidth.mp4",
+
+  "log_url": "https://api.a4b.io/gw4/log/v1/ingest",
+  "log_app_name": "daily_darshan",
+  "log_token": "<x-api-key>",
+  "log_interval": "2m"
+}

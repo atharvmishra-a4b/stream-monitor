@@ -20,13 +20,17 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/dev-a4b/stream-monitor/agent/config"
 	"github.com/dev-a4b/stream-monitor/agent/obs"
+	"github.com/dev-a4b/stream-monitor/agent/obslog"
 	"github.com/dev-a4b/stream-monitor/agent/rw"
 	"github.com/dev-a4b/stream-monitor/agent/speedtest"
 	"github.com/dev-a4b/stream-monitor/agent/wifi"
@@ -88,6 +92,8 @@ type agent struct {
 	prevNet  map[string]gnet.IOCountersStat
 	prevTime time.Time
 
+	dry          bool
+	given        map[string]bool
 	obsClient    *obs.Client
 	obsURL       string
 	obsReporting bool
@@ -97,6 +103,23 @@ type agent struct {
 	speedMB     int
 	speedConns  int
 	speedFailed int64
+
+	cfg       *config.Loader
+	cfgEvery  time.Duration
+	stateDir  string
+	speedURL  string
+	logURL    string
+	logToken  string
+	logApp    string
+	obsLogDir string
+	logEvery  time.Duration
+	logShip   *obslog.Shipper
+
+	// each background job runs under its own cancel so config changes can restart just that one
+	stopSpeed context.CancelFunc
+	stopLog   context.CancelFunc
+	tick      *time.Ticker
+	jobsMu    sync.Mutex
 
 	wifiEvery     time.Duration
 	wifiMu        sync.RWMutex
@@ -130,9 +153,18 @@ func main() {
 	flag.StringVar(&obsPass, "obs-password", os.Getenv("STREAM_OBS_PASSWORD"), "OBS WebSocket password (enables OBS metrics)")
 	var speedBytes, speedParallel int
 	var speedURL string
+	flag.StringVar(&a.stateDir, "state-dir", defaultStateDir(), "where to keep the cached config and log position")
+	var cfgURL string
+	flag.StringVar(&cfgURL, "config-url", os.Getenv("STREAM_CONFIG_URL"), "URL of a shared JSON config; settings there apply unless given on the command line")
+	flag.DurationVar(&a.cfgEvery, "config-interval", 5*time.Minute, "how often to re-read the shared config (0 reads it only at startup)")
+	flag.StringVar(&a.logURL, "log-url", os.Getenv("STREAM_LOG_URL"), "endpoint that receives OBS's log, as GELF over HTTP (empty turns it off)")
+	flag.StringVar(&a.logToken, "log-token", os.Getenv("STREAM_LOG_TOKEN"), "token sent as the x-api-key header to the log endpoint")
+	flag.StringVar(&a.logApp, "log-app-name", envOr("STREAM_LOG_APP_NAME", "daily_darshan"), "value of the x-afb-app-name header")
+	flag.DurationVar(&a.logEvery, "log-interval", 2*time.Minute, "how often to send collected OBS log lines")
+	flag.StringVar(&a.obsLogDir, "obs-log-dir", "", "OBS log folder (default: find it under the user profiles)")
 	flag.DurationVar(&a.speedEvery, "speedtest-interval", 0, "how often to measure real download speed (0 turns it off, e.g. 1m)")
-	flag.IntVar(&speedBytes, "speedtest-bytes", 10, "megabytes to download per speed test")
-	flag.IntVar(&speedParallel, "speedtest-parallel", 4, "parallel connections per speed test")
+	flag.IntVar(&speedBytes, "speedtest-bytes", 0, "megabytes per speed test (0 = download the whole file at --speedtest-url)")
+	flag.IntVar(&speedParallel, "speedtest-parallel", 1, "parallel connections per speed test")
 	flag.StringVar(&speedURL, "speedtest-url", "", "speed test URL with a %d for the byte count (default: Cloudflare)")
 	flag.DurationVar(&a.wifiEvery, "wifi-interval", 30*time.Second, "how often to read the Wi-Fi link rate (0 turns it off)")
 	flag.BoolVar(&dry, "dry-run", false, "just print readings, do not send anything")
@@ -158,13 +190,38 @@ func main() {
 		a.obsClient = obs.New(obsURL, obsPass, a.interval)
 	}
 
-	if a.speedEvery > 0 {
-		a.speedMB, a.speedConns = speedBytes, speedParallel
-		a.speed = speedtest.New(speedURL, int64(speedBytes)*1_000_000, speedParallel)
+	a.speedMB, a.speedConns, a.speedURL = speedBytes, speedParallel, speedURL
+
+	// Settings given on the command line win over the shared config, so one laptop can be pinned
+	// for debugging without editing the file the whole fleet reads.
+	given := map[string]bool{}
+	flag.Visit(func(f *flag.Flag) { given[f.Name] = true })
+	a.given, a.dry = given, dry
+	// Read in dry-run too: fetching is not sending, and seeing which settings would apply is
+	// exactly what a dry run is for.
+	if cfgURL != "" {
+		a.cfg = config.New(cfgURL, filepath.Join(a.stateDir, "config.json"), a.temple)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// Read the shared config before the first measurement, but never block startup on it: a laptop
+	// booting while its internet is down must still start and buffer.
+	if a.cfg != nil {
+		boot, cancel := context.WithTimeout(ctx, 15*time.Second)
+		s, err := a.cfg.Load(boot)
+		cancel()
+		switch {
+		case err != nil:
+			log.Printf("shared config: %v (carrying on with the settings given here)", err)
+		default:
+			log.Printf("shared config loaded from %s", cfgURL)
+		}
+		if err == nil || a.cfg != nil {
+			a.apply(s, given)
+		}
+	}
 	a.run(ctx, dry)
 }
 
@@ -185,9 +242,26 @@ func (a *agent) run(ctx context.Context, dry bool) {
 	if a.wifiEvery > 0 {
 		go a.pollWifi(ctx)
 	}
-	if a.speed != nil {
-		go a.speed.Run(ctx, a.speedEvery)
-		log.Printf("measuring download speed every %v (%d MB, %d connections)", a.speedEvery, a.speedMB, a.speedConns)
+	if a.speedEvery > 0 {
+		size := "the whole file"
+		if a.speedMB > 0 {
+			size = fmt.Sprintf("%d MB", a.speedMB)
+		}
+		log.Printf("measuring download speed every %v (%s, %d connections)", a.speedEvery, size, a.speedConns)
+	}
+	if a.logURL != "" {
+		log.Printf("shipping OBS logs to %s every %v", a.logURL, a.logEvery)
+	}
+	a.restartJobs(ctx)
+
+	// Re-read the shared config periodically so a change reaches the fleet without anyone
+	// touching a laptop. A file that becomes unreachable leaves the agent on its current settings.
+	if a.cfg != nil && a.cfgEvery > 0 {
+		go a.cfg.Watch(ctx, a.cfgEvery, func(s config.Settings) {
+			log.Printf("shared config changed, applying")
+			a.apply(s, a.given)
+			a.restartJobs(ctx)
+		}, func(err error) { log.Printf("shared config: %v", err) })
 	}
 	if a.obsClient != nil {
 		go a.obsClient.Run(ctx)
@@ -202,6 +276,9 @@ func (a *agent) run(ctx context.Context, dry bool) {
 	}
 
 	tick := time.NewTicker(a.interval)
+	a.jobsMu.Lock()
+	a.tick = tick
+	a.jobsMu.Unlock()
 	defer tick.Stop()
 	for {
 		select {
@@ -215,8 +292,8 @@ func (a *agent) run(ctx context.Context, dry bool) {
 			fmt.Printf("cpu %.0f%%  memory %.0f%%  up %.0f kbps  down %.0f kbps  errors %.1f/min\n", s.CPU, s.Mem, s.NetUp/1000, s.NetDown/1000, s.NetErr)
 			if a.speed != nil {
 				if r := a.speed.Latest(); r != nil {
-					fmt.Printf("    speed test: %.1f Mbit/s  (%d MB in %.1fs, %d failures)\n",
-						r.Mbps, a.speedMB, r.Duration.Seconds(), a.speed.Failures())
+					fmt.Printf("    speed test: %.1f Mbit/s  (%.1f MB in %.1fs, %d failures)\n",
+						r.Mbps, float64(r.Bytes)/1e6, r.Duration.Seconds(), a.speed.Failures())
 				} else {
 					fmt.Printf("    speed test: no successful measurement yet (%d failures)\n", a.speed.Failures())
 				}
@@ -293,6 +370,93 @@ func (a *agent) measure() Sample {
 		s.Programs, s.Gone = a.selectTop(a.readPrograms(now))
 	}
 	return s
+}
+
+func defaultStateDir() string {
+	if runtime.GOOS == "windows" {
+		return `C:\ProgramData\StreamMonitor`
+	}
+	return filepath.Join(os.TempDir(), "stream-agent")
+}
+
+// apply takes settings from the shared config, skipping anything given on the command line.
+// Jobs whose settings changed are restarted; the measurement interval is simply retimed.
+func (a *agent) apply(s config.Settings, given map[string]bool) {
+	set := func(name string, ok bool) bool { return ok && !given[name] }
+
+	if set("interval", s.Interval != nil) && s.Interval.Std() > 0 {
+		a.interval = s.Interval.Std()
+	}
+	if set("wifi-interval", s.WifiInterval != nil) {
+		a.wifiEvery = s.WifiInterval.Std()
+	}
+	if set("programs-interval", s.ProgramsInterval != nil) {
+		a.progEvery = s.ProgramsInterval.Std()
+	}
+	if set("speedtest-interval", s.SpeedtestInterval != nil) {
+		a.speedEvery = s.SpeedtestInterval.Std()
+	}
+	if set("speedtest-bytes", s.SpeedtestBytes != nil) {
+		a.speedMB = *s.SpeedtestBytes
+	}
+	if set("speedtest-parallel", s.SpeedtestParallel != nil) {
+		a.speedConns = *s.SpeedtestParallel
+	}
+	if set("speedtest-url", s.SpeedtestURL != nil) {
+		a.speedURL = *s.SpeedtestURL
+	}
+	if set("log-url", s.LogURL != nil) {
+		a.logURL = *s.LogURL
+	}
+	if set("log-token", s.LogToken != nil) {
+		a.logToken = *s.LogToken
+	}
+	if set("log-app-name", s.LogAppName != nil) {
+		a.logApp = *s.LogAppName
+	}
+	if set("log-interval", s.LogInterval != nil) {
+		a.logEvery = s.LogInterval.Std()
+	}
+	if set("obs-log-dir", s.ObsLogDir != nil) {
+		a.obsLogDir = *s.ObsLogDir
+	}
+}
+
+// restartJobs brings the background jobs into line with the current settings. Safe to call
+// repeatedly: each job is stopped and started again only as needed.
+func (a *agent) restartJobs(ctx context.Context) {
+	a.jobsMu.Lock()
+	defer a.jobsMu.Unlock()
+
+	if a.stopSpeed != nil {
+		a.stopSpeed()
+		a.stopSpeed = nil
+		a.speed = nil
+	}
+	if a.speedEvery > 0 {
+		a.speed = speedtest.New(a.speedURL, int64(a.speedMB)*1_000_000, a.speedConns)
+		c, cancel := context.WithCancel(ctx)
+		a.stopSpeed = cancel
+		go a.speed.Run(c, a.speedEvery)
+	}
+
+	if a.stopLog != nil {
+		a.stopLog()
+		a.stopLog = nil
+		a.logShip = nil
+	}
+	if a.logURL != "" && !a.dry {
+		a.logShip = obslog.New(a.logURL, a.logToken, a.logApp, a.obsLogDir,
+			filepath.Join(a.stateDir, "obslog-position.json"),
+			obslog.Labels{Hub: a.hub, Temple: a.temple, Device: a.name})
+		c, cancel := context.WithCancel(ctx)
+		a.stopLog = cancel
+		go a.logShip.Run(c, a.logEvery)
+	}
+
+	if a.tick != nil && a.interval > 0 {
+		a.tick.Reset(a.interval)
+	}
 }
 
 // pollWifi refreshes the Wi-Fi reading on its own slower clock. Reading it costs an OS call that
@@ -445,10 +609,29 @@ func (a *agent) buildSeries(batch []Sample) []rw.Series {
 		}
 	}
 	out = append(out, rw.Series{Name: "stream_laptop_info", Labels: info, Samples: []rw.Point{{TS: batch[len(batch)-1].TS * 1000, Value: 1}}})
+	out = append(out, a.logSeries(base, batch)...)
 	out = append(out, a.speedSeries(base, batch)...)
 	out = append(out, a.wifiSeries(base, batch)...)
 	out = append(out, a.obsSeries(base, batch)...)
 	return append(out, a.programSeries(base, batch)...)
+}
+
+// OBS log shipping, so that losing logs is visible rather than silent. A rising drop or failure
+// count means the log endpoint is unreachable or the laptop is producing more than can be sent.
+func (a *agent) logSeries(base []rw.Label, batch []Sample) []rw.Series {
+	a.jobsMu.Lock()
+	sh := a.logShip
+	a.jobsMu.Unlock()
+	if sh == nil {
+		return nil
+	}
+	shipped, dropped, failures := sh.Stats()
+	ts := batch[len(batch)-1].TS * 1000
+	return []rw.Series{
+		{Name: "stream_laptop_obslog_shipped_total", Labels: base, Samples: []rw.Point{{TS: ts, Value: float64(shipped)}}},
+		{Name: "stream_laptop_obslog_dropped_total", Labels: base, Samples: []rw.Point{{TS: ts, Value: float64(dropped)}}},
+		{Name: "stream_laptop_obslog_failures_total", Labels: base, Samples: []rw.Point{{TS: ts, Value: float64(failures)}}},
+	}
 }
 
 // Measured download speed: what this laptop can actually pull right now, as opposed to what it

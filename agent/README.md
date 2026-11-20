@@ -21,7 +21,8 @@ Just want to see the numbers without sending anything? Use `--dry-run`.
 
 ## Measured download speed (optional)
 
-`--speedtest-interval 1m` downloads 10 MB (`--speedtest-bytes`) over 4 parallel connections and
+`--speedtest-interval 1m` downloads 10 MB (`--speedtest-bytes`) over 4 parallel connections
+(`--speedtest-parallel`) and
 reports what the line actually delivers, whether or not anything else is using it. This exists for
 one situation: a stream looks wrong, and the people on site report that the connection is fine.
 
@@ -36,8 +37,78 @@ Two things to know before turning it on:
   speed, so a 165 Mbit/s line may read around 90. The error shrinks as the line gets worse, which is
   where accuracy matters: treat readings as a baseline to compare against, not an exact capacity.
 
-One connection cannot fill a modern line, so four run in parallel and the first 500 ms are excluded
-from the timing.
+Timing starts once a quarter of the bytes have arrived, so TCP's slow opening is excluded at any
+speed.
+
+**Point it at your own file instead of Cloudflare** with `--speedtest-url`. Any URL serving range
+requests works (S3 and CloudFront both do), and it measures the path to your own infrastructure
+rather than to somebody else's edge:
+
+```bash
+--speedtest-url "https://cdn.example.com/test/10mb.bin" --speedtest-parallel 1
+```
+
+A URL containing `%d` is handed the byte count, as Cloudflare's endpoint expects. Any other URL is
+treated as a fixed file and fetched with a `Range` header, so several connections split one file
+between them rather than downloading it once each.
+
+`--speedtest-parallel` defaults to 4, because one connection cannot fill a line to a distant
+endpoint. Against a nearby CDN that does not apply: measured against a Mumbai edge, one connection
+reached 216 Mbit/s and four reached 201, so `1` is the better choice there and costs a quarter of
+the data.
+
+## Shared configuration
+
+`--config-url` points the agent at a JSON file, fetched at startup and re-read every few minutes
+(`--config-interval`), so the fleet can be retuned from one place instead of one laptop at a time.
+Ours is at `https://srm-cdn.a4b.io/obs/monitoring_agent.json`:
+
+```json
+{
+  "defaults": { "interval": "5s", "speedtest_interval": "1m", "speedtest_bytes": 10 },
+  "temples":  { "Maa GajLaxmi temple": { "speedtest_bytes": 50 } }
+}
+```
+
+Settable: `interval`, `wifi_interval`, `programs_interval`, `speedtest_interval`, `speedtest_bytes`,
+`speedtest_parallel`, `speedtest_url`, `graylog_url`, `graylog_token`, `graylog_interval`,
+`obs_log_dir`.
+Per-temple entries override the defaults, because sites genuinely differ: a laptop on gigabit
+Ethernet needs a larger speed-test sample than one on weak Wi-Fi.
+
+Three rules stop a shared file becoming a single point of failure:
+
+- **A flag given on the command line always wins**, so one laptop can be pinned without editing the
+  file everyone reads.
+- **A failed fetch is never fatal.** The last good document is cached on disk, so a laptop booting
+  while its internet is down starts with the settings it had and keeps measuring.
+- **Identity is never taken from the file.** `hub`, `temple` and `name` come from the install, so a
+  mistake cannot rename the fleet.
+
+Changes to the speed test, log shipping and the measurement interval apply on the next re-read; the
+rest take effect at the next restart, which for these laptops is the same day.
+
+## OBS logs to Graylog
+
+`--log-url` ships OBS's own log, which is what explains an incident afterwards: the line that
+accounted for the 19 November outage was an ordinary informational line reporting the Wi-Fi rate,
+carrying no error at all. **Nothing is filtered** for that reason, and a full day is about a
+megabyte per laptop.
+
+Lines are batched and sent every `--log-interval` (default 2m) as newline-delimited GELF, each
+carrying `_hub`, `_temple` and `_device` so a Graylog search lines up with the matching Grafana
+panel. `--log-token` is sent as the `x-api-key` header and `--log-app-name` as `x-afb-app-name`.
+
+> **A token in the shared config is readable by anyone who can read the config.** `graylog_token`
+> works there and is the convenient choice for a file served privately. If the config is a public
+> object, pass the token with `-LogToken` at install time or in `STREAM_LOG_TOKEN` instead,
+> and leave the key out of the file. Progress is remembered in the state directory, so a restart does not resend.
+
+The agent runs as SYSTEM while OBS runs as the logged-in user, so `%APPDATA%` inside the agent is
+not where OBS writes. The user profiles are scanned instead; `--obs-log-dir` overrides that.
+
+`stream_laptop_obslog_shipped_total`, `..._dropped_total` and `..._failures_total` make loss visible
+rather than silent.
 
 ## How the laptop is connected
 

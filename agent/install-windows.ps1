@@ -13,6 +13,16 @@
 # connection is visible even when nothing else is using it. That is about 14 GB per laptop per day:
 # raise the interval or lower -SpeedtestBytes to cut it. 0 (the default) turns it off entirely.
 #
+# -SpeedtestUrl points the test at a file of your own instead of Cloudflare, which measures the path
+# to your own infrastructure. Any URL serving range requests will do (S3 and CloudFront both do).
+# Against a nearby CDN one connection saturates the line, so -SpeedtestParallel 1 is enough:
+#   -SpeedtestUrl "https://srm-cdn.a4b.io/test/obs_network_bandwidth.mp4" -SpeedtestParallel 1
+#
+# -ConfigUrl points at a shared JSON file so the fleet can be retuned from one place. Anything set
+# on this command line wins over it, so a single laptop can be pinned for debugging.
+#
+# -LogUrl ships OBS's own log file, which is what explains an incident after the fact.
+#
 # -ObsPassword turns on OBS metrics (dropped frames, reconnects, real stream bitrate). Enable the
 # server first in OBS: Tools > WebSocket Server Settings > Enable WebSocket server. Without it the
 # agent behaves exactly as before, so it is safe to omit on laptops that do not run OBS.
@@ -29,7 +39,12 @@ param(
   [string] $ObsUrl = "ws://127.0.0.1:4455",
   [string] $WifiInterval = "30s",      # how often to read the Wi-Fi link rate; 0 turns it off
   [string] $SpeedtestInterval = "0",   # e.g. 1m to measure real download speed; 0 turns it off
-  [int]    $SpeedtestBytes = 10,       # megabytes per speed test
+  [int]    $SpeedtestBytes = 0,        # megabytes per test; 0 = whole file at -SpeedtestUrl
+  [int]    $SpeedtestParallel = 1,     # connections per test; 1 is enough for a nearby CDN
+  [string] $SpeedtestUrl = "",         # own CDN file; blank uses Cloudflare
+  [string] $ConfigUrl = "",            # shared JSON config; settings there apply unless set here
+  [string] $LogUrl = "",           # endpoint that receives OBS's log
+  [string] $LogToken = "",         # sent as the X-API-Key header
   [string] $Username = "",
   [string] $Password = "",
   [string] $Exe = "$PSScriptRoot\stream-agent-windows.exe"
@@ -44,7 +59,12 @@ Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyCo
 New-Item -ItemType Directory -Force -Path $dir | Out-Null
 Copy-Item $Exe "$dir\stream-agent.exe" -Force
 
-$agentArgs = "--remote-write `"$RemoteWrite`" --hub `"$Hub`" --temple `"$Temple`" --name `"$Name`" --interval `"$Interval`" --wifi-interval `"$WifiInterval`" --speedtest-interval `"$SpeedtestInterval`" --speedtest-bytes $SpeedtestBytes"
+$agentArgs = "--remote-write `"$RemoteWrite`" --hub `"$Hub`" --temple `"$Temple`" --name `"$Name`" --interval `"$Interval`" --wifi-interval `"$WifiInterval`" --speedtest-interval `"$SpeedtestInterval`" --speedtest-bytes $SpeedtestBytes --speedtest-parallel $SpeedtestParallel"
+if ($SpeedtestUrl) { $agentArgs += " --speedtest-url `"$SpeedtestUrl`"" }
+if ($ConfigUrl)    { $agentArgs += " --config-url `"$ConfigUrl`"" }
+if ($LogUrl)   { $agentArgs += " --log-url `"$LogUrl`"" }
+if ($LogToken)   { $agentArgs += " --log-token `"$LogToken`"" }
+if ($LogAppName) { $agentArgs += " --log-app-name `"$LogAppName`"" }
 if ($Username)    { $agentArgs += " --username `"$Username`" --password `"$Password`"" }
 if ($ObsPassword) { $agentArgs += " --obs-password `"$ObsPassword`" --obs-url `"$ObsUrl`"" }
 $action   = New-ScheduledTaskAction -Execute "$dir\stream-agent.exe" -Argument $agentArgs -WorkingDirectory $dir

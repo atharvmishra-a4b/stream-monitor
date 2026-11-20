@@ -231,6 +231,10 @@ make it permanent.
 | `-WifiInterval` | `--wifi-interval` | `30s` | Wi-Fi link rate; `0` off |
 | `-SpeedtestInterval` | `--speedtest-interval` | `0` (off) | measured download speed, e.g. `1m` |
 | `-SpeedtestBytes` | `--speedtest-bytes` | `10` | MB per speed test |
+| `-ConfigUrl` | `--config-url` | — | shared JSON config; everything below can come from it |
+| `-LogUrl` | `--log-url` | — | endpoint receiving OBS's log |
+| `-LogToken` | `--log-token` | — | sent as `x-api-key` |
+| `-LogAppName` | `--log-app-name` | `daily_darshan` | sent as `x-afb-app-name` |
 | `-ObsPassword` | `--obs-password` | — | enables OBS metrics |
 | `-ObsUrl` | `--obs-url` | `ws://127.0.0.1:4455` | OBS WebSocket address |
 | `-Username` / `-Password` | `--username` / `--password` | — | not needed until auth lands |
