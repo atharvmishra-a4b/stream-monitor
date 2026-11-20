@@ -15,12 +15,15 @@ x-api-key: <token>
 Both headers are sent in lowercase exactly as written above. Header names are case-insensitive by
 spec, so matching case-insensitively is safest, but `x-api-key` is what will arrive.
 
-Body is **newline-delimited JSON** (GELF 1.1) — one object per log line, many per request:
+Body is a **JSON array** of GELF 1.1 objects — one per log line, many per request. A single
+`json.loads(body)` reads it:
 
 ```json
-{"version":"1.1","host":"Main hall 1","short_message":"[rtmp stream: 'multi-output'] Interface: Intel(R) Wi-Fi 6E AX211 160MHz (802.11, 2402↓/2402↑ mbps)","timestamp":1795063505.644,"level":6,"_hub":"Ujjain","_temple":"Khedapati Hanuman temple","_device":"Main hall 1","_source":"obs"}
-{"version":"1.1","host":"Main hall 1","short_message":"[obs-ffmpeg mpegts muxer / libsrt]: Connection was broken","timestamp":1795063509.368,"level":3,"_hub":"Ujjain","_temple":"Khedapati Hanuman temple","_device":"Main hall 1","_source":"obs"}
-{"version":"1.1","host":"Main hall 1","short_message":"Output 'adv_stream': Total frames output: 143043","timestamp":1795063509.368,"level":6,"_hub":"Ujjain","_temple":"Khedapati Hanuman temple","_device":"Main hall 1","_source":"obs"}
+[
+  {"version":"1.1","host":"Main hall 1","short_message":"[rtmp stream: 'multi-output'] Interface: Intel(R) Wi-Fi 6E AX211 160MHz (802.11, 2402↓/2402↑ mbps)","timestamp":1795063505.644,"level":6,"_hub":"Ujjain","_temple":"Khedapati Hanuman temple","_device":"Main hall 1","_source":"obs"},
+  {"version":"1.1","host":"Main hall 1","short_message":"[obs-ffmpeg mpegts muxer / libsrt]: Connection was broken","timestamp":1795063509.368,"level":3,"_hub":"Ujjain","_temple":"Khedapati Hanuman temple","_device":"Main hall 1","_source":"obs"},
+  {"version":"1.1","host":"Main hall 1","short_message":"Output 'adv_stream': Total frames output: 143043","timestamp":1795063509.368,"level":6,"_hub":"Ujjain","_temple":"Khedapati Hanuman temple","_device":"Main hall 1","_source":"obs"}
+]
 ```
 
 ## Fields
@@ -50,6 +53,10 @@ drop, and the whole point is correlating them with what the dashboards show.
 
 A plain `202 Accepted` with an empty body is fine. The agent does not read the response body.
 
+**Please return a 4xx or 5xx when the batch cannot be stored**, including when the body fails to
+parse. A 200 returned while the handler errored tells the agent the lines were delivered, so it
+discards them and they are lost. Retrying is automatic, but only if the failure is visible.
+
 ## Volume and behaviour
 
 - One request every **2 minutes** per laptop (configurable).
@@ -73,5 +80,5 @@ curl -X POST "https://api.a4b.io/gw4/log/v1/ingest" \
   -H "Content-Type: application/json" \
   -H "x-afb-app-name: daily_darshan" \
   -H "x-api-key: <token>" \
-  --data-binary $'{"version":"1.1","host":"Main hall 1","short_message":"Output \'adv_stream\': stopping","timestamp":1795063509.368,"level":6,"_hub":"Ujjain","_temple":"Khedapati Hanuman temple","_device":"Main hall 1","_source":"obs"}\n{"version":"1.1","host":"Main hall 1","short_message":"Connection was broken","timestamp":1795063509.368,"level":3,"_hub":"Ujjain","_temple":"Khedapati Hanuman temple","_device":"Main hall 1","_source":"obs"}'
+  --data-binary '[{"version":"1.1","host":"Main hall 1","short_message":"Output stopping","timestamp":1795063509.368,"level":6,"_hub":"Ujjain","_temple":"Khedapati Hanuman temple","_device":"Main hall 1","_source":"obs"},{"version":"1.1","host":"Main hall 1","short_message":"Connection was broken","timestamp":1795063509.368,"level":3,"_hub":"Ujjain","_temple":"Khedapati Hanuman temple","_device":"Main hall 1","_source":"obs"}]'
 ```

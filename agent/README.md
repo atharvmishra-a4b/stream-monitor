@@ -97,7 +97,7 @@ accounted for the 19 November outage was an ordinary informational line reportin
 carrying no error at all. **Nothing is filtered** for that reason, and a full day is about a
 megabyte per laptop.
 
-Lines are batched and sent every `--log-interval` (default 2m) as newline-delimited GELF, each
+Lines are batched and sent every `--log-interval` (default 2m) as a JSON array of GELF objects, each
 carrying `_hub`, `_temple` and `_device` so a Graylog search lines up with the matching Grafana
 panel. `--log-token` is sent as the `x-api-key` header and `--log-app-name` as `x-afb-app-name`.
 

@@ -323,16 +323,17 @@ func (s *Shipper) flush(ctx context.Context) {
 	}
 }
 
-// send posts newline-delimited GELF, which Graylog and most collectors accept as a bulk payload.
+// send posts the batch as a JSON array of GELF objects.
+//
+// Graylog's own HTTP input wants newline-delimited objects, but anything behind API Gateway and
+// Lambda reads the body with a single json.loads, which fails on the second line. An array is the
+// one shape both can read, so it is what we send.
 func (s *Shipper) send(ctx context.Context, batch []gelf) error {
-	var body bytes.Buffer
-	enc := json.NewEncoder(&body)
-	for _, g := range batch {
-		if err := enc.Encode(g); err != nil {
-			return err
-		}
+	body := new(bytes.Buffer)
+	if err := json.NewEncoder(body).Encode(batch); err != nil {
+		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.url, &body)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.url, body)
 	if err != nil {
 		return err
 	}
