@@ -34,17 +34,21 @@ param(
   [Parameter(Mandatory)] [string] $Hub,
   [Parameter(Mandatory)] [string] $Temple,
   [string] $Name = $env:COMPUTERNAME,
-  [string] $Interval = "15s",          # how often to measure, e.g. 5s, 15s, 1m
+  [string] $Interval = "",             # how often to measure, e.g. 5s. Blank: use the shared config.
   [string] $ObsPassword = "",          # OBS > Tools > WebSocket Server Settings; enables OBS metrics
   [string] $ObsUrl = "ws://127.0.0.1:4455",
-  [string] $WifiInterval = "30s",      # how often to read the Wi-Fi link rate; 0 turns it off
-  [string] $SpeedtestInterval = "0",   # e.g. 1m to measure real download speed; 0 turns it off
-  [int]    $SpeedtestBytes = 0,        # megabytes per test; 0 = whole file at -SpeedtestUrl
-  [int]    $SpeedtestParallel = 1,     # connections per test; 1 is enough for a nearby CDN
+  [string] $ObsLogDir = "",            # OBS log folder (default: find it under the user profiles)
+  [string] $WifiInterval = "",         # how often to read the link rate; 0 turns it off
+  [string] $ProgramsInterval = "",     # how often to report the top programs; 0 turns it off
+  [string] $SpeedtestInterval = "",    # e.g. 1m to measure real download speed; 0 turns it off
+  [string] $SpeedtestBytes = "",       # megabytes per test; 0 = whole file at -SpeedtestUrl
+  [string] $SpeedtestParallel = "",    # connections per test; 1 is enough for a nearby CDN
   [string] $SpeedtestUrl = "",         # own CDN file; blank uses Cloudflare
   [string] $ConfigUrl = "",            # shared JSON config; settings there apply unless set here
-  [string] $LogUrl = "",           # endpoint that receives OBS's log
-  [string] $LogToken = "",         # sent as the X-API-Key header
+  [string] $LogUrl = "",               # endpoint that receives OBS's log
+  [string] $LogToken = "",             # sent as the x-api-key header
+  [string] $LogAppName = "",           # sent as the x-afb-app-name header
+  [string] $LogInterval = "",          # how often to send collected log lines
   [string] $Username = "",
   [string] $Password = "",
   [string] $Exe = "$PSScriptRoot\stream-agent-windows.exe"
@@ -59,14 +63,25 @@ Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyCo
 New-Item -ItemType Directory -Force -Path $dir | Out-Null
 Copy-Item $Exe "$dir\stream-agent.exe" -Force
 
-$agentArgs = "--remote-write `"$RemoteWrite`" --hub `"$Hub`" --temple `"$Temple`" --name `"$Name`" --interval `"$Interval`" --wifi-interval `"$WifiInterval`" --speedtest-interval `"$SpeedtestInterval`" --speedtest-bytes $SpeedtestBytes --speedtest-parallel $SpeedtestParallel"
-if ($SpeedtestUrl) { $agentArgs += " --speedtest-url `"$SpeedtestUrl`"" }
-if ($ConfigUrl)    { $agentArgs += " --config-url `"$ConfigUrl`"" }
-if ($LogUrl)   { $agentArgs += " --log-url `"$LogUrl`"" }
-if ($LogToken)   { $agentArgs += " --log-token `"$LogToken`"" }
-if ($LogAppName) { $agentArgs += " --log-app-name `"$LogAppName`"" }
-if ($Username)    { $agentArgs += " --username `"$Username`" --password `"$Password`"" }
-if ($ObsPassword) { $agentArgs += " --obs-password `"$ObsPassword`" --obs-url `"$ObsUrl`"" }
+# Only pass a flag that was actually given. A flag on the command line deliberately overrides the
+# shared config, so passing one unconditionally would pin that setting to the installer's default
+# and make it impossible to change centrally.
+$agentArgs = "--remote-write `"$RemoteWrite`" --hub `"$Hub`" --temple `"$Temple`" --name `"$Name`""
+if ($Interval)          { $agentArgs += " --interval `"$Interval`"" }
+if ($WifiInterval)      { $agentArgs += " --wifi-interval `"$WifiInterval`"" }
+if ($ProgramsInterval)  { $agentArgs += " --programs-interval `"$ProgramsInterval`"" }
+if ($SpeedtestInterval) { $agentArgs += " --speedtest-interval `"$SpeedtestInterval`"" }
+if ($SpeedtestBytes)    { $agentArgs += " --speedtest-bytes $SpeedtestBytes" }
+if ($SpeedtestParallel) { $agentArgs += " --speedtest-parallel $SpeedtestParallel" }
+if ($SpeedtestUrl)      { $agentArgs += " --speedtest-url `"$SpeedtestUrl`"" }
+if ($ConfigUrl)         { $agentArgs += " --config-url `"$ConfigUrl`"" }
+if ($LogUrl)            { $agentArgs += " --log-url `"$LogUrl`"" }
+if ($LogToken)          { $agentArgs += " --log-token `"$LogToken`"" }
+if ($LogAppName)        { $agentArgs += " --log-app-name `"$LogAppName`"" }
+if ($LogInterval)       { $agentArgs += " --log-interval `"$LogInterval`"" }
+if ($ObsLogDir)         { $agentArgs += " --obs-log-dir `"$ObsLogDir`"" }
+if ($Username)          { $agentArgs += " --username `"$Username`" --password `"$Password`"" }
+if ($ObsPassword)       { $agentArgs += " --obs-password `"$ObsPassword`" --obs-url `"$ObsUrl`"" }
 $action   = New-ScheduledTaskAction -Execute "$dir\stream-agent.exe" -Argument $agentArgs -WorkingDirectory $dir
 $trigger  = New-ScheduledTaskTrigger -AtStartup
 $settings = New-ScheduledTaskSettingsSet -RestartCount 99 -RestartInterval (New-TimeSpan -Minutes 1) `

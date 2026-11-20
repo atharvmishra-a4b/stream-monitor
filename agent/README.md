@@ -79,7 +79,9 @@ Ethernet needs a larger speed-test sample than one on weak Wi-Fi.
 Three rules stop a shared file becoming a single point of failure:
 
 - **A flag given on the command line always wins**, so one laptop can be pinned without editing the
-  file everyone reads.
+  file everyone reads. The installer therefore passes only the flags you actually give it: passing
+  one unconditionally would pin that setting to the installer's default and make it impossible to
+  change centrally.
 - **A failed fetch is never fatal.** The last good document is cached on disk, so a laptop booting
   while its internet is down starts with the settings it had and keeps measuring.
 - **Identity is never taken from the file.** `hub`, `temple` and `name` come from the install, so a
